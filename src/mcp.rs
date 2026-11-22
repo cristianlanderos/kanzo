@@ -23,6 +23,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::Who;
 use crate::home::Home;
 use crate::share::{self, Net};
 use crate::store::{self, Error, Project, Store, Task, TaskPatch, short_time};
@@ -142,6 +143,21 @@ fn reply(outcome: Result<String, String>) -> CallToolResult {
     }
 }
 
+/// The user whose access token came with the call, on a board with accounts. Over stdio there
+/// is none: `kanzo mcp` runs on the computer that holds the board.
+fn user(ext: &Extensions) -> Option<i64> {
+    Some(ext.get::<Parts>()?.extensions.get::<Who>()?.user.as_ref()?.id)
+}
+
+/// A user's name as an agent passes it; "" is nobody.
+fn assignee(store: &Store, name: Option<&str>) -> store::Result<Option<i64>> {
+    match name.map(str::trim) {
+        None => Ok(None),
+        Some("") => Ok(Some(0)),
+        Some(name) => Ok(Some(store.user_by_name(name)?.id)),
+    }
+}
+
 /// Clients on protocol 2026-07-28 name themselves on every request; older ones did once, in `initialize`.
 fn caller(context: &RequestContext<RoleServer>) -> Option<Implementation> {
     match context.meta.protocol_version() {
@@ -206,8 +222,8 @@ struct ListTasksArgs {
     project: Option<String>,
     /// One column, or "all". Done is left out by default.
     status: Option<String>,
-    /// Words, or tag: status: project: title: description: url: comment: id: comments: images: created: updated:
-    /// is:human is:waiting has: no:, like tag:bug -status:done. Includes done.
+    /// Words, or tag: status: project: assignee: title: description: url: comment: id: comments: images: created:
+    /// updated: is:human is:waiting has: no:, like tag:bug -status:done. Includes done.
     filter: Option<String>,
 }
 
@@ -233,6 +249,8 @@ struct CreateTaskArgs {
     human: Option<bool>,
     /// Tasks it waits on, like api#12.
     waits_on: Option<String>,
+    /// A user's name.
+    assignee: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -255,6 +273,8 @@ struct UpdateTaskArgs {
     url: Option<String>,
     /// Tasks it waits on, like api#12; "" clears.
     waits_on: Option<String>,
+    /// A user's name; "" clears.
+    assignee: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -486,10 +506,11 @@ impl Kanzo {
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
             .run_for(&ext, move |ctx, store| {
-                let CreateTaskArgs { title, description, project, tags, status, human, waits_on } = args;
+                let CreateTaskArgs { title, description, project, tags, status, human, waits_on, assignee: to } = args;
                 let project = ctx.project(store, project.as_deref())?;
                 let status = status.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
-                let patch = TaskPatch { description, status, tags, human, waits_on, ..Default::default() };
+                let assignee = assignee(store, to.as_deref())?;
+                let patch = TaskPatch { description, status, tags, human, waits_on, assignee, ..Default::default() };
                 let t = store.create_task_in(project.id, &title, patch)?;
                 Ok(format!("Created {} in {}: {}{}", t.key(), t.status, t.title, waits_note(store, &t)?))
             })
@@ -515,6 +536,7 @@ impl Kanzo {
                         human: args.human,
                         url: args.url,
                         waits_on: args.waits_on,
+                        assignee: assignee(store, args.assignee.as_deref())?,
                     },
                 )?;
                 let was = if before.project != after.project { format!("{} -> ", before.key()) } else { String::new() };
@@ -536,10 +558,11 @@ impl Kanzo {
     ) -> Result<CallToolResult, ErrorData> {
         let client = caller(&context).map(|i| i.name).filter(|n| !n.is_empty());
         let author = args.author.filter(|a| !a.trim().is_empty()).or(client).unwrap_or_else(|| "agent".into());
+        let user = user(&context.extensions);
         Ok(self
             .run(move |_, store| {
                 let task = args.id.find(store)?;
-                store.add_comment(task.id, &author, &args.body, &[])?;
+                store.add_comment_by(task.id, &author, user, &args.body, &[])?;
                 Ok(format!("Comment added to {} as {author}.", task.key()))
             })
             .await)
@@ -551,15 +574,16 @@ impl Kanzo {
         Parameters(args): Parameters<NextTaskArgs>,
         ext: Extensions,
     ) -> Result<CallToolResult, ErrorData> {
+        let user = user(&ext);
         Ok(self
             .run_for(&ext, move |ctx, store| {
                 let project = ctx.scope(store, args.project.as_deref())?;
                 let id = project.as_ref().map(|p| p.id);
                 let filter = args.filter.as_deref().unwrap_or("");
-                match store.next_task_matching(id, filter)? {
+                match store.next_task_matching(id, filter, user)? {
                     Some(task) => Ok(format!("Moved to {}:\n{}", task.status, task_detail(ctx, store, &task)?)),
                     None => {
-                        let waiting = store.waiting_in_todo(id, filter)?;
+                        let waiting = store.waiting_in_todo(id, filter, user)?;
                         let scope = project.map_or("any project".into(), |p| p.slug);
                         Ok(match waiting {
                             0 => format!("Nothing in todo for {scope}."),
@@ -605,9 +629,10 @@ impl ServerHandler for Kanzo {
         if let Some(cwd) = &self.ctx.cwd
             && let Net::Joined(host) = Net::load(&self.ctx.home)
         {
+            let token = share::token(&self.ctx.home);
             let mut upstream = self.ctx.host.lock().await;
-            if upstream.as_ref().is_none_or(|u| u.host() != host) {
-                *upstream = Some(share::Upstream::new(host, cwd, &self.ctx.repos, &self.ctx.images));
+            if upstream.as_ref().is_none_or(|u| !u.is(&host, token.as_deref())) {
+                *upstream = Some(share::Upstream::new(host, token, cwd, &self.ctx.repos, &self.ctx.images));
             }
             let client = share::handshake(context.peer.peer_info().as_deref(), &context.meta);
             let upstream = upstream.as_mut().expect("set above");
@@ -686,6 +711,9 @@ fn task_detail(ctx: &Ctx, store: &Store, t: &Task) -> store::Result<String> {
     }
     if t.human && shown(&hidden, "human") {
         out.push_str(", human: for the user, not for agents");
+    }
+    if let Some(user) = t.assignee {
+        let _ = write!(out, ", assigned to {}", store.get_user(user)?.name);
     }
     if shown(&hidden, "created") {
         let _ = write!(out, ", created {created}");

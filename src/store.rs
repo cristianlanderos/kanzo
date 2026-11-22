@@ -54,7 +54,37 @@ const MIGRATIONS: &[&str] = &[
      CREATE TRIGGER task_waits_insert AFTER INSERT ON task_waits BEGIN UPDATE meta SET value = value + 1 WHERE key = 'changes'; END;
      CREATE TRIGGER task_waits_delete AFTER DELETE ON task_waits BEGIN UPDATE meta SET value = value + 1 WHERE key = 'changes'; END;",
     "ALTER TABLE projects ADD COLUMN position REAL;",
+    // Accounts. Sessions and tokens have no change trigger: signing in is nothing a board redraws for.
+    "CREATE TABLE users (
+         id         INTEGER PRIMARY KEY AUTOINCREMENT,
+         name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+         password   TEXT NOT NULL,
+         admin      INTEGER NOT NULL DEFAULT 0,
+         avatar     TEXT,
+         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+     );
+     CREATE TABLE sessions (
+         token      TEXT PRIMARY KEY,
+         user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+     ) WITHOUT ROWID;
+     CREATE TABLE tokens (
+         id         INTEGER PRIMARY KEY AUTOINCREMENT,
+         user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+         name       TEXT NOT NULL,
+         token      TEXT NOT NULL UNIQUE,
+         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+     );
+     ALTER TABLE tasks ADD COLUMN assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+     ALTER TABLE comments ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+     CREATE INDEX tasks_by_assignee ON tasks(assignee_id);
+     CREATE TRIGGER users_insert AFTER INSERT ON users BEGIN UPDATE meta SET value = value + 1 WHERE key = 'changes'; END;
+     CREATE TRIGGER users_update AFTER UPDATE ON users BEGIN UPDATE meta SET value = value + 1 WHERE key = 'changes'; END;
+     CREATE TRIGGER users_delete AFTER DELETE ON users BEGIN UPDATE meta SET value = value + 1 WHERE key = 'changes'; END;",
 ];
+
+/// How long a browser stays signed in.
+const SESSION_DAYS: u32 = 30;
 
 const PROJECT_COLORS: &[&str] = &["gray", "red", "orange", "yellow", "green", "teal", "blue", "purple", "pink"];
 
@@ -124,6 +154,38 @@ pub struct Task {
     /// The tasks this one waits on that aren't done yet. Left out when there are none, as on most tasks.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub waiting_on: Vec<i64>,
+    /// The user it is assigned to. Left out when it has none, as on every task of a board without accounts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<i64>,
+}
+
+/// Someone with an account on the board. Never carries the password.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct User {
+    pub id: i64,
+    pub name: String,
+    pub admin: bool,
+    /// An image file in the data folder's `images`, like a task's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+}
+
+/// An access token as its owner sees it later: the secret itself is shown once, when it is made.
+#[derive(Debug, Clone, Serialize)]
+pub struct Token {
+    pub id: i64,
+    pub name: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Default)]
+pub struct UserPatch {
+    pub name: Option<String>,
+    /// Already hashed.
+    pub password: Option<String>,
+    pub admin: Option<bool>,
+    /// `Some(None)` takes the picture away.
+    pub avatar: Option<Option<String>>,
 }
 
 impl Task {
@@ -146,6 +208,9 @@ pub struct Comment {
     pub id: i64,
     pub task_id: i64,
     pub author: String,
+    /// The user who wrote it, or whose access token the agent that wrote it used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i64>,
     pub body: String,
     pub created_at: String,
 }
@@ -169,6 +234,8 @@ pub struct TaskPatch {
     pub human: Option<bool>,
     /// Task keys, comma-separated; it replaces the list.
     pub waits_on: Option<String>,
+    /// A user's id; 0 assigns it to nobody.
+    pub assignee: Option<i64>,
 }
 
 const STATUSES: [&str; 4] = ["todo", "doing", "review", "done"];
@@ -517,7 +584,7 @@ impl Store {
 
     const TASK_SELECT: &str = "SELECT t.id, p.slug, t.title, t.description, t.status, t.position,
             t.created_at, t.updated_at, (SELECT count(*) FROM comments c WHERE c.task_id = t.id), t.tags, t.human,
-            t.url
+            t.url, t.assignee_id
         FROM tasks t JOIN projects p ON p.id = t.project_id";
 
     fn task_row(r: &Row) -> rusqlite::Result<Task> {
@@ -535,6 +602,7 @@ impl Store {
             updated_at: r.get(7)?,
             comments: r.get(8)?,
             waiting_on: Vec::new(),
+            assignee: r.get(12)?,
         })
     }
 
@@ -684,19 +752,23 @@ impl Store {
     }
 
     // One write, or an agent could take a task before it's human, or before it waits.
-    // Uses description, status, tags, human, waits_on.
+    // Uses description, status, tags, human, waits_on, assignee.
     pub fn create_task_in(&self, project_id: i64, title: &str, patch: TaskPatch) -> Result<Task> {
         let title = clean_title(title)?;
         let status = patch.status.as_deref().unwrap_or(STATUSES[0]);
         self.check_status(status)?;
         let description = patch.description.as_deref().unwrap_or("").trim();
         let tags = clean_tags(patch.tags.as_deref().unwrap_or("")).join(",");
+        let assignee = patch.assignee.filter(|a| *a != 0);
         let id = self.write(|c| {
+            if let Some(user) = assignee {
+                self.get_user(user)?;
+            }
             let position = Self::end_of_column(c, status, 0)?;
             c.execute(
-                "INSERT INTO tasks (project_id, title, description, status, position, tags, human) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![project_id, title, description, status, position, tags, patch.human.unwrap_or(false)],
+                "INSERT INTO tasks (project_id, title, description, status, position, tags, human, assignee_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![project_id, title, description, status, position, tags, patch.human.unwrap_or(false), assignee],
             )?;
             let id = c.last_insert_rowid();
             if let Some(keys) = &patch.waits_on {
@@ -790,6 +862,18 @@ impl Store {
             }
             if let Some(keys) = &patch.waits_on {
                 self.set_waits(c, id, keys)?;
+            }
+            if let Some(user) = patch.assignee {
+                let user = (user != 0).then_some(user);
+                if let Some(user) = user {
+                    self.get_user(user)?;
+                }
+                c.execute(
+                    &format!(
+                        "UPDATE tasks SET assignee_id = ?1, updated_at = {NOW} WHERE id = ?2 AND assignee_id IS NOT ?1"
+                    ),
+                    params![user, id],
+                )?;
             }
             Ok(())
         })?;
@@ -899,20 +983,23 @@ impl Store {
 
     #[cfg(test)]
     pub fn next_task(&self, project_id: Option<i64>) -> Result<Option<Task>> {
-        self.next_task_matching(project_id, "")
+        self.next_task_matching(project_id, "", None)
     }
 
     /// The todo tasks for agents that match `query`, from FROM on, with its values.
-    fn agents_todo(&self, project_id: Option<i64>, query: &str) -> Result<(String, Vec<Value>)> {
+    /// An agent working for `user` leaves the tasks assigned to someone else.
+    fn agents_todo(&self, project_id: Option<i64>, query: &str, user: Option<i64>) -> Result<(String, Vec<Value>)> {
         let filter = if query.trim().is_empty() {
             Filter::default()
         } else {
             self.add_has_word()?;
             Filter::new(query, 3, &self.hidden_properties()?)
         };
+        // A number, so it is safe in the SQL itself, where it doesn't shift the filter's values.
+        let own = user.map(|u| format!(" AND (t.assignee_id IS NULL OR t.assignee_id = {u})")).unwrap_or_default();
         let sql = format!(
             "FROM tasks t JOIN projects p ON p.id = t.project_id
-             WHERE t.status = ?1 AND t.human = 0 AND (?2 IS NULL OR t.project_id = ?2){}",
+             WHERE t.status = ?1 AND t.human = 0 AND (?2 IS NULL OR t.project_id = ?2){own}{}",
             filter.sql
         );
         let mut values: Vec<Value> = vec![STATUSES[0].to_string().into(), project_id.into()];
@@ -921,14 +1008,14 @@ impl Store {
     }
 
     /// How many tasks `next_task` skips because they wait on others.
-    pub fn waiting_in_todo(&self, project_id: Option<i64>, query: &str) -> Result<i64> {
-        let (todo, values) = self.agents_todo(project_id, query)?;
+    pub fn waiting_in_todo(&self, project_id: Option<i64>, query: &str, user: Option<i64>) -> Result<i64> {
+        let (todo, values) = self.agents_todo(project_id, query, user)?;
         let sql = format!("SELECT count(*) {todo} AND {WAITING}");
         Ok(self.conn.query_row(&sql, rusqlite::params_from_iter(values), |r| r.get(0))?)
     }
 
-    pub fn next_task_matching(&self, project_id: Option<i64>, query: &str) -> Result<Option<Task>> {
-        let (todo, values) = self.agents_todo(project_id, query)?;
+    pub fn next_task_matching(&self, project_id: Option<i64>, query: &str, user: Option<i64>) -> Result<Option<Task>> {
+        let (todo, values) = self.agents_todo(project_id, query, user)?;
         let to = STATUSES[1];
         let id = self.write(|c| {
             let sql = format!("SELECT t.id {todo} AND NOT {WAITING} ORDER BY t.position LIMIT 1");
@@ -966,13 +1053,33 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    const COMMENT_SELECT: &str = "SELECT id, task_id, author, body, created_at FROM comments";
+    const COMMENT_SELECT: &str = "SELECT id, task_id, author, body, created_at, user_id FROM comments";
 
     fn comment_row(r: &Row) -> rusqlite::Result<Comment> {
-        Ok(Comment { id: r.get(0)?, task_id: r.get(1)?, author: r.get(2)?, body: r.get(3)?, created_at: r.get(4)? })
+        Ok(Comment {
+            id: r.get(0)?,
+            task_id: r.get(1)?,
+            author: r.get(2)?,
+            user_id: r.get(5)?,
+            body: r.get(3)?,
+            created_at: r.get(4)?,
+        })
     }
 
+    #[cfg(test)]
     pub fn add_comment(&self, task_id: i64, author: &str, body: &str, images: &[String]) -> Result<Comment> {
+        self.add_comment_by(task_id, author, None, body, images)
+    }
+
+    /// `user` is who wrote it, on a board with accounts.
+    pub fn add_comment_by(
+        &self,
+        task_id: i64,
+        author: &str,
+        user: Option<i64>,
+        body: &str,
+        images: &[String],
+    ) -> Result<Comment> {
         let body = body.trim();
         if body.is_empty() && images.is_empty() {
             return Err(Error::Invalid("comment body is empty".into()));
@@ -985,8 +1092,8 @@ impl Store {
         self.get_task(task_id)?;
         let id = self.write(|c| {
             c.execute(
-                "INSERT INTO comments (task_id, author, body) VALUES (?1, ?2, ?3)",
-                params![task_id, author, body],
+                "INSERT INTO comments (task_id, author, body, user_id) VALUES (?1, ?2, ?3, ?4)",
+                params![task_id, author, body, user],
             )?;
             let id = c.last_insert_rowid();
             let mut insert = c.prepare("INSERT INTO images (task_id, comment_id, file) VALUES (?1, ?2, ?3)")?;
@@ -1062,7 +1169,10 @@ impl Store {
     }
 
     pub fn unused_images(&self, files: Vec<String>) -> Result<Vec<String>> {
-        let mut used = self.conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM images WHERE file = ?1)")?;
+        // A profile picture is an image file too, and can be the same one a task shows.
+        let mut used = self.conn.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM images WHERE file = ?1) OR EXISTS (SELECT 1 FROM users WHERE avatar = ?1)",
+        )?;
         let mut unused = Vec::new();
         for file in files {
             if !used.query_row([&file], |r| r.get::<_, bool>(0))? {
@@ -1071,6 +1181,208 @@ impl Store {
         }
         Ok(unused)
     }
+}
+
+/// Accounts: users, the sessions of their browsers and the access tokens of their agents.
+impl Store {
+    const USER_SELECT: &str = "SELECT u.id, u.name, u.admin, u.avatar FROM users u";
+
+    fn user_row(r: &Row) -> rusqlite::Result<User> {
+        Ok(User { id: r.get(0)?, name: r.get(1)?, admin: r.get(2)?, avatar: r.get(3)? })
+    }
+
+    /// A board asks for logins from its first user on.
+    pub fn has_users(&self) -> Result<bool> {
+        Ok(self.conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM users)")?.query_row([], |r| r.get(0))?)
+    }
+
+    pub fn list_users(&self) -> Result<Vec<User>> {
+        let mut stmt = self.conn.prepare_cached(&format!("{} ORDER BY u.name", Self::USER_SELECT))?;
+        let rows = stmt.query_map([], Self::user_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn get_user(&self, id: i64) -> Result<User> {
+        self.conn
+            .prepare_cached(&format!("{} WHERE u.id = ?1", Self::USER_SELECT))?
+            .query_row([id], Self::user_row)
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("no user {id}")))
+    }
+
+    pub fn user_by_name(&self, name: &str) -> Result<User> {
+        let name = name.trim().trim_start_matches('@');
+        self.conn
+            .prepare_cached(&format!("{} WHERE u.name = ?1", Self::USER_SELECT))?
+            .query_row([name], Self::user_row)
+            .optional()?
+            .ok_or_else(|| {
+                let known: Vec<String> = self.list_users().unwrap_or_default().into_iter().map(|u| u.name).collect();
+                let hint = if known.is_empty() {
+                    "this board has no users".to_string()
+                } else {
+                    format!("users: {}", known.join(", "))
+                };
+                Error::NotFound(format!("no user {name:?} ({hint})"))
+            })
+    }
+
+    /// The user and the stored hash of their password, to check a login against.
+    pub fn login(&self, name: &str) -> Result<Option<(User, String)>> {
+        let sql = "SELECT u.id, u.name, u.admin, u.avatar, u.password FROM users u WHERE u.name = ?1";
+        Ok(self.conn.query_row(sql, [name.trim()], |r| Ok((Self::user_row(r)?, r.get(4)?))).optional()?)
+    }
+
+    /// `password` is already hashed. The first user runs the board, whatever `admin` says.
+    pub fn create_user(&self, name: &str, password: &str, admin: bool) -> Result<User> {
+        let name = clean_user_name(name)?;
+        let id = self.write(|c| {
+            self.check_name_free(&name, 0)?;
+            let first = !self.has_users()?;
+            c.execute(
+                "INSERT INTO users (name, password, admin) VALUES (?1, ?2, ?3)",
+                params![name, password, admin || first],
+            )?;
+            Ok(c.last_insert_rowid())
+        })?;
+        self.get_user(id)
+    }
+
+    fn check_name_free(&self, name: &str, except: i64) -> Result<()> {
+        let taken: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM users WHERE name = ?1 AND id <> ?2)",
+            params![name, except],
+            |r| r.get(0),
+        )?;
+        if taken { Err(Error::Invalid(format!("there is already a user named {name}"))) } else { Ok(()) }
+    }
+
+    /// Someone must always be able to add and remove users.
+    fn check_admin_left(&self, without: i64) -> Result<()> {
+        let left: i64 =
+            self.conn.query_row("SELECT count(*) FROM users WHERE admin AND id <> ?1", [without], |r| r.get(0))?;
+        if left == 0 {
+            return Err(Error::Invalid("the board needs an admin: make another user an admin first".into()));
+        }
+        Ok(())
+    }
+
+    /// A new password signs the user out everywhere but in the browser that changed it, `keep`.
+    /// Returns the picture the user had, when this changed it, for the caller to delete.
+    pub fn update_user(&self, id: i64, patch: UserPatch, keep: Option<&str>) -> Result<(User, Option<String>)> {
+        let name = patch.name.as_deref().map(clean_user_name).transpose()?;
+        if let Some(Some(file)) = &patch.avatar {
+            check_image(file)?;
+        }
+        let old = self.write(|c| {
+            let current = self.get_user(id)?;
+            if let Some(name) = &name {
+                self.check_name_free(name, id)?;
+                c.execute("UPDATE users SET name = ?1 WHERE id = ?2 AND name IS NOT ?1", params![name, id])?;
+            }
+            if let Some(admin) = patch.admin
+                && admin != current.admin
+            {
+                if !admin {
+                    self.check_admin_left(id)?;
+                }
+                c.execute("UPDATE users SET admin = ?1 WHERE id = ?2", params![admin, id])?;
+            }
+            if let Some(password) = &patch.password {
+                c.execute("UPDATE users SET password = ?1 WHERE id = ?2", params![password, id])?;
+                c.execute("DELETE FROM sessions WHERE user_id = ?1 AND token IS NOT ?2", params![id, keep])?;
+            }
+            match &patch.avatar {
+                Some(avatar) if *avatar != current.avatar => {
+                    c.execute("UPDATE users SET avatar = ?1 WHERE id = ?2", params![avatar, id])?;
+                    Ok(current.avatar)
+                }
+                _ => Ok(None),
+            }
+        })?;
+        Ok((self.get_user(id)?, old))
+    }
+
+    /// Their tasks stay, assigned to nobody, and so do their comments. The last user can
+    /// go: the board is then open again, as before it had accounts.
+    pub fn delete_user(&self, id: i64) -> Result<User> {
+        self.write(|c| {
+            let user = self.get_user(id)?;
+            let others: i64 = c.query_row("SELECT count(*) FROM users WHERE id <> ?1", [id], |r| r.get(0))?;
+            if user.admin && others > 0 {
+                self.check_admin_left(id)?;
+            }
+            c.execute("DELETE FROM users WHERE id = ?1", [id])?;
+            Ok(user)
+        })
+    }
+
+    /// `token` is the session's digest. Sessions that ran out go at the same time.
+    pub fn create_session(&self, user: i64, token: &str) -> Result<()> {
+        self.write(|c| {
+            c.execute(
+                &format!("DELETE FROM sessions WHERE created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{SESSION_DAYS} days')"),
+                [],
+            )?;
+            c.execute("INSERT INTO sessions (token, user_id) VALUES (?1, ?2)", params![token, user])?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_session(&self, token: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM sessions WHERE token = ?1", [token])?;
+        Ok(())
+    }
+
+    pub fn session_user(&self, token: &str) -> Result<Option<User>> {
+        let sql = format!(
+            "{} JOIN sessions s ON s.user_id = u.id WHERE s.token = ?1
+               AND s.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{SESSION_DAYS} days')",
+            Self::USER_SELECT
+        );
+        Ok(self.conn.prepare_cached(&sql)?.query_row([token], Self::user_row).optional()?)
+    }
+
+    /// `token` is the access token's digest.
+    pub fn token_user(&self, token: &str) -> Result<Option<User>> {
+        let sql = format!("{} JOIN tokens k ON k.user_id = u.id WHERE k.token = ?1", Self::USER_SELECT);
+        Ok(self.conn.prepare_cached(&sql)?.query_row([token], Self::user_row).optional()?)
+    }
+
+    pub fn create_token(&self, user: i64, name: &str, token: &str) -> Result<Token> {
+        let name = squash(name);
+        if name.is_empty() || name.chars().count() > 60 {
+            return Err(Error::Invalid("name the token in 1 to 60 characters, like the agent that uses it".into()));
+        }
+        self.conn
+            .execute("INSERT INTO tokens (user_id, name, token) VALUES (?1, ?2, ?3)", params![user, name, token])?;
+        let id = self.conn.last_insert_rowid();
+        Ok(self.list_tokens(user)?.into_iter().find(|t| t.id == id).expect("just inserted"))
+    }
+
+    pub fn list_tokens(&self, user: i64) -> Result<Vec<Token>> {
+        let mut stmt =
+            self.conn.prepare_cached("SELECT id, name, created_at FROM tokens WHERE user_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([user], |r| Ok(Token { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)? }))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_token(&self, user: i64, id: i64) -> Result<()> {
+        match self.conn.execute("DELETE FROM tokens WHERE id = ?1 AND user_id = ?2", [id, user])? {
+            0 => Err(Error::NotFound(format!("no token {id}"))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Shown on tasks and comments, and typed after `assignee:`, so short and on one line.
+fn clean_user_name(name: &str) -> Result<String> {
+    let name = squash(name);
+    let length = name.chars().count();
+    if length == 0 || length > 40 || name.contains([',', '"', '@']) {
+        return Err(Error::Invalid("a user name is 1 to 40 characters, without commas, quotes or @".into()));
+    }
+    Ok(name)
 }
 
 pub enum ImagesOf {
@@ -1123,7 +1435,8 @@ const IMAGE_COUNT: &str = "(SELECT count(*) FROM images WHERE task_id = t.id)";
 /// Computed, never stored: reopening a task blocks what waits on it again, with nothing to keep in step.
 const WAITING: &str = "EXISTS (SELECT 1 FROM task_waits w JOIN tasks b ON b.id = w.waits_on_id
     WHERE w.task_id = t.id AND b.status <> 'done')";
-const QUALIFIERS: [&str; 15] = [
+const QUALIFIERS: [&str; 16] = [
+    "assignee",
     "tag",
     "status",
     "project",
@@ -1218,6 +1531,11 @@ impl Filter {
             ("images", range) => range_sql(IMAGE_COUNT, range, number)?,
             ("created", range) => range_sql("substr(t.created_at, 1, 10)", range, date)?,
             ("updated", range) => range_sql("substr(t.updated_at, 1, 10)", range, date)?,
+            ("assignee", name) => {
+                // EXISTS, not IN: a task with nobody must count as "not hers" under `-assignee:`.
+                format!("EXISTS (SELECT 1 FROM users u WHERE u.id = t.assignee_id AND u.name = {})", self.bind(name))
+            }
+            ("has" | "no", "assignee") => "t.assignee_id IS NOT NULL".to_string(),
             ("is", "human") => "t.human".to_string(),
             ("is", "waiting") => WAITING.to_string(),
             ("has" | "no", "description") => "t.description <> ''".to_string(),
@@ -1401,9 +1719,9 @@ mod tests {
         s.update_task(blocked.id, waits(&format!("#{}, api#{}", blocker.id, other.id))).unwrap();
         assert_eq!(s.get_task(blocked.id).unwrap().waiting_on, [blocker.id, other.id]);
 
-        assert_eq!(s.next_task_matching(None, "tag:bug").unwrap().map(|t| t.id), None);
-        assert_eq!(s.waiting_in_todo(None, "tag:bug").unwrap(), 1);
-        assert_eq!(s.waiting_in_todo(None, "tag:nope").unwrap(), 0);
+        assert_eq!(s.next_task_matching(None, "tag:bug", None).unwrap().map(|t| t.id), None);
+        assert_eq!(s.waiting_in_todo(None, "tag:bug", None).unwrap(), 1);
+        assert_eq!(s.waiting_in_todo(None, "tag:nope", None).unwrap(), 0);
         assert_eq!(s.next_task(None).unwrap().map(|t| t.id), Some(other.id));
         s.move_task(other.id, "done", None).unwrap();
         assert_eq!(s.get_task(blocked.id).unwrap().waiting_on, [blocker.id]);
@@ -1789,7 +2107,7 @@ mod tests {
         tagged("First in the epic", false);
         tagged("Second in the epic", false);
 
-        let next = |q: &str| s.next_task_matching(Some(api.id), q).unwrap().map(|t| t.title);
+        let next = |q: &str| s.next_task_matching(Some(api.id), q, None).unwrap().map(|t| t.title);
         assert_eq!(next("is:human"), None);
         assert_eq!(next("tag:nope"), None);
         assert_eq!(next("tag:billing").as_deref(), Some("First in the epic"));
@@ -1812,7 +2130,7 @@ mod tests {
         s.set_property("comments", false).unwrap();
         assert_eq!((found("tag:secret"), found("secret"), found("comment:whisper"), found("whisper")), (0, 0, 0, 0));
         assert_eq!(found("has:tags"), 0);
-        assert_eq!(s.next_task_matching(None, "tag:secret").unwrap().map(|t| t.id), None);
+        assert_eq!(s.next_task_matching(None, "tag:secret", None).unwrap().map(|t| t.id), None);
         assert_eq!(found("plain"), 1, "what stays visible still matches");
         assert_eq!(s.search("tag:secret", None).unwrap().len(), 1, "the board still sees them");
     }
@@ -2172,5 +2490,117 @@ mod tests {
         assert!(s.move_tasks(&[b, 99999], "doing", None).is_err());
         assert!(order("todo").contains(&b));
         assert!(s.move_tasks(&[b], "nope", None).is_err());
+    }
+
+    #[test]
+    fn the_first_user_runs_the_board_and_an_admin_always_stays() {
+        let (_dir, s) = store();
+        assert!(!s.has_users().unwrap());
+        let ana = s.create_user("  Ana  Lima ", "hash", false).unwrap();
+        assert_eq!((ana.name.as_str(), ana.admin), ("Ana Lima", true), "the first user is an admin");
+        let ben = s.create_user("Ben", "hash", false).unwrap();
+        assert!(!ben.admin && s.has_users().unwrap());
+
+        assert!(s.create_user("ben", "hash", false).is_err(), "names differ by more than case");
+        for bad in ["", "a,b", "a@b", &"x".repeat(41)] {
+            assert!(s.create_user(bad, "hash", false).is_err(), "{bad}");
+        }
+        let demote = UserPatch { admin: Some(false), ..Default::default() };
+        assert!(s.update_user(ana.id, demote, None).unwrap_err().to_string().contains("needs an admin"));
+        assert!(s.delete_user(ana.id).is_err(), "the only admin, with another user left");
+
+        let promote = UserPatch { admin: Some(true), name: Some("Benny".into()), ..Default::default() };
+        assert_eq!(s.update_user(ben.id, promote, None).unwrap().0.name, "Benny");
+        assert_eq!(s.user_by_name("@benny").unwrap().id, ben.id);
+        s.delete_user(ana.id).unwrap();
+        s.delete_user(ben.id).unwrap();
+        assert!(!s.has_users().unwrap(), "the last user can go: the board is open again");
+    }
+
+    #[test]
+    fn tasks_are_assigned_filtered_and_left_to_their_user() {
+        let (_dir, s) = store();
+        let p = s.create_project("api", "", None).unwrap();
+        let ana = s.create_user("Ana", "hash", false).unwrap();
+        let ben = s.create_user("Ben", "hash", false).unwrap();
+        let assigned = |to: i64| TaskPatch { assignee: Some(to), ..Default::default() };
+        let hers = s.create_task_in(p.id, "Hers", assigned(ana.id)).unwrap();
+        let free = s.create_task(p.id, "Free", "").unwrap();
+        assert_eq!((hers.assignee, free.assignee), (Some(ana.id), None));
+        assert!(s.update_task(free.id, assigned(99)).is_err(), "no such user");
+
+        let found = |q: &str| s.search(q, None).unwrap().into_iter().map(|t| t.title).collect::<Vec<_>>();
+        assert_eq!(found("assignee:ana"), ["Hers"]);
+        assert_eq!(found("-assignee:ana"), ["Free"]);
+        assert_eq!(found("no:assignee"), ["Free"]);
+        assert_eq!(found("has:assignee"), ["Hers"]);
+
+        // An agent working for Ben skips what is Ana's; one for nobody in particular takes it.
+        assert_eq!(s.next_task_matching(None, "", Some(ben.id)).unwrap().unwrap().title, "Free");
+        assert!(s.next_task_matching(None, "", Some(ben.id)).unwrap().is_none());
+        assert_eq!(s.next_task_matching(None, "", None).unwrap().unwrap().title, "Hers");
+
+        let before = s.get_task(hers.id).unwrap().updated_at;
+        assert_eq!(s.update_task(hers.id, assigned(ana.id)).unwrap().updated_at, before, "nothing changed");
+        assert_eq!(s.update_task(hers.id, assigned(0)).unwrap().assignee, None);
+        s.update_task(hers.id, assigned(ana.id)).unwrap();
+        let comment = s.add_comment_by(hers.id, "Ana", Some(ana.id), "mine", &[]).unwrap();
+        assert_eq!(comment.user_id, Some(ana.id));
+
+        s.delete_user(ben.id).unwrap();
+        s.update_user(ben.id, UserPatch::default(), None).unwrap_err();
+        let promote = UserPatch { admin: Some(true), ..Default::default() };
+        let cara = s.create_user("Cara", "hash", false).unwrap();
+        s.update_user(cara.id, promote, None).unwrap();
+        s.delete_user(ana.id).unwrap();
+        assert_eq!(s.get_task(hers.id).unwrap().assignee, None, "her tasks stay, assigned to nobody");
+        assert_eq!(s.list_comments(hers.id).unwrap()[0].user_id, None, "and her comments, under her name");
+    }
+
+    #[test]
+    fn sessions_tokens_and_pictures_belong_to_their_user() {
+        let (_dir, s) = store();
+        let ana = s.create_user("Ana", "old", false).unwrap();
+        s.create_session(ana.id, "browser-a").unwrap();
+        s.create_session(ana.id, "browser-b").unwrap();
+        assert_eq!(s.session_user("browser-a").unwrap().unwrap().id, ana.id);
+        assert!(s.session_user("nobody").unwrap().is_none());
+        assert_eq!(s.login("ANA").unwrap().unwrap().1, "old");
+
+        let before = s.changes().unwrap();
+        s.create_session(ana.id, "browser-c").unwrap();
+        s.delete_session("browser-c").unwrap();
+        assert_eq!(s.changes().unwrap(), before, "signing in redraws no board");
+
+        // A new password keeps only the browser that set it.
+        let patch = UserPatch { password: Some("new".into()), ..Default::default() };
+        s.update_user(ana.id, patch, Some("browser-a")).unwrap();
+        assert!(s.session_user("browser-a").unwrap().is_some());
+        assert!(s.session_user("browser-b").unwrap().is_none());
+        assert_eq!(s.login("Ana").unwrap().unwrap().1, "new");
+
+        s.conn.execute("UPDATE sessions SET created_at = '2020-01-01T00:00:00Z'", []).unwrap();
+        assert!(s.session_user("browser-a").unwrap().is_none(), "a session runs out");
+
+        let token = s.create_token(ana.id, " Claude  Code ", "digest").unwrap();
+        assert_eq!(token.name, "Claude Code");
+        assert!(s.create_token(ana.id, "", "other").is_err());
+        assert_eq!(s.token_user("digest").unwrap().unwrap().id, ana.id);
+        assert!(s.delete_token(ana.id + 1, token.id).is_err(), "not someone else's");
+        s.delete_token(ana.id, token.id).unwrap();
+        assert!(s.token_user("digest").unwrap().is_none());
+
+        let picture = |file: &str| UserPatch { avatar: Some(Some(file.into())), ..Default::default() };
+        assert!(s.update_user(ana.id, picture("../x.png"), None).is_err());
+        assert_eq!(s.update_user(ana.id, picture("00000000000000aa.png"), None).unwrap().1, None);
+        let (user, old) = s.update_user(ana.id, picture("00000000000000bb.png"), None).unwrap();
+        assert_eq!(
+            (user.avatar.as_deref(), old.as_deref()),
+            (Some("00000000000000bb.png"), Some("00000000000000aa.png"))
+        );
+        let files = vec!["00000000000000aa.png".to_string(), "00000000000000bb.png".to_string()];
+        assert_eq!(s.unused_images(files).unwrap(), ["00000000000000aa.png"], "a picture in use is kept");
+        let (user, old) = s.update_user(ana.id, UserPatch { avatar: Some(None), ..Default::default() }, None).unwrap();
+        assert_eq!((user.avatar, old.as_deref()), (None, Some("00000000000000bb.png")));
     }
 }

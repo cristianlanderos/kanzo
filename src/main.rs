@@ -1,3 +1,4 @@
+mod auth;
 mod export;
 mod home;
 mod mcp;
@@ -91,6 +92,28 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Manage the board's accounts from this computer, like to reset a forgotten password
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserAction {
+    /// List the users
+    List,
+    /// Add a user, with the password read from the terminal; the first one turns logins on and is an admin
+    Add {
+        name: String,
+        /// Let them add and remove users
+        #[arg(long)]
+        admin: bool,
+    },
+    /// Set a user's password, read from the terminal, and sign them out everywhere
+    Password { name: String },
+    /// Remove a user; their tasks and comments stay. Removing the last one turns logins off
+    Remove { name: String },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -177,8 +200,59 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Leave) => network(home, Some(share::Change::Leave), !cli.no_open).await,
         Some(Command::Service { action: ServiceAction::Install }) => service::install(&home),
         Some(Command::Service { action: ServiceAction::Uninstall }) => service::uninstall(),
+        Some(Command::User { action }) => users(&home, action),
         Some(Command::Update) => unreachable!("handled above"),
     }
+}
+
+/// Whoever can run this already reads and writes the data folder, so it asks for no login.
+fn users(home: &Home, action: UserAction) -> anyhow::Result<()> {
+    let store = home.store()?;
+    let password = || -> anyhow::Result<String> {
+        eprint!("Password (shown as you type): ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let password = line.trim_end_matches(['\r', '\n']);
+        auth::check_password(password).map_err(anyhow::Error::msg)?;
+        Ok(auth::hash_password(password))
+    };
+    match action {
+        UserAction::List => {
+            let users = store.list_users()?;
+            if users.is_empty() {
+                println!("No users: the board asks for no login. Add the first with `kanzo user add <name>`.");
+            }
+            for user in users {
+                println!("{}{}", user.name, if user.admin { " (admin)" } else { "" });
+            }
+        }
+        UserAction::Add { name, admin } => {
+            let first = !store.has_users()?;
+            let user = store.create_user(&name, &password()?, admin)?;
+            let role = if user.admin { " as an admin" } else { "" };
+            println!("Added {}{role}.", user.name);
+            if first {
+                println!("The board now asks everyone to sign in.");
+            }
+        }
+        UserAction::Password { name } => {
+            let user = store.user_by_name(&name)?;
+            let patch = store::UserPatch { password: Some(password()?), ..Default::default() };
+            store.update_user(user.id, patch, None)?;
+            println!("Changed the password of {}, and signed them out everywhere.", user.name);
+        }
+        UserAction::Remove { name } => {
+            let user = store.delete_user(store.user_by_name(&name)?.id)?;
+            for file in store.unused_images(user.avatar.into_iter().collect())? {
+                let _ = std::fs::remove_file(home.images().join(file));
+            }
+            println!("Removed {}.", user.name);
+            if !store.has_users()? {
+                println!("No users are left: the board asks for no login.");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn update_kanzo() -> anyhow::Result<()> {
