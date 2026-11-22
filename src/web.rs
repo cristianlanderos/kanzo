@@ -62,7 +62,13 @@ pub async fn serve(home: Home, open: bool) -> Result<()> {
         Net::Joined(host) => println!("It also shows the board at {host}."),
         _ => {
             println!("{}", guard.status().message());
-            println!("Anyone who can reach port {port} can read and change this board.");
+            if home.store().and_then(|s| s.has_users()).unwrap_or(false) {
+                println!("It asks everyone to sign in.");
+            } else {
+                println!(
+                    "Anyone who can reach port {port} can read and change this board: add a user in Settings to ask for a login."
+                );
+            }
         }
     }
     if home.config.mcp_http {
@@ -955,10 +961,16 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
 }
 
-/// What anyone may load: the page that asks for the login, and what it needs to ask. The two
-/// routes only this computer can use stay open to it, for `kanzo share` and `kanzo join`.
-fn open_to_all(path: &str) -> bool {
-    const OPEN: [&str; 10] = [
+/// What anyone may load: the page that asks for the login, and what it needs to ask.
+fn open_to_all(req: &Request) -> bool {
+    let path = req.uri().path();
+    // `kanzo share` and `kanzo join` ask the board on this computer, with no login to give. A
+    // proxy on this computer would make every visitor look local, so what it forwards doesn't count.
+    if path == "/api/network" || path == "/api/open" {
+        let forwarded = ["forwarded", "x-forwarded-for", "x-real-ip"].iter().any(|h| req.headers().contains_key(*h));
+        return guest(req).is_none() && !forwarded;
+    }
+    const OPEN: [&str; 8] = [
         "/",
         "/app.js",
         "/logo.png",
@@ -967,8 +979,6 @@ fn open_to_all(path: &str) -> bool {
         "/changelog.md",
         "/api/ping",
         "/api/session",
-        "/api/network",
-        "/api/open",
     ];
     OPEN.contains(&path) || path.starts_with("/i18n/")
 }
@@ -997,7 +1007,7 @@ async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next: Nex
         Ok(who) => who,
         Err(e) => return e.into_response(),
     };
-    if who.accounts && who.user.is_none() && !open_to_all(req.uri().path()) {
+    if who.accounts && who.user.is_none() && !open_to_all(&req) {
         let mut res = (StatusCode::UNAUTHORIZED, Json(json!({ "error": "sign in to use this board", "login": true })))
             .into_response();
         res.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -1070,7 +1080,7 @@ async fn sign_in(
         Some(user) => start_session(home, &auth, user).await,
         None => {
             auth.failed(ip);
-            Err(fail(StatusCode::UNAUTHORIZED, "wrong name or password"))
+            Err(fail(StatusCode::UNAUTHORIZED, "Wrong name or password."))
         }
     }
 }
@@ -1687,9 +1697,11 @@ mod tests {
             assert_eq!(call(port, "GET", closed, &[], "").await.0, 401, "{closed}");
         }
         assert_eq!(call(port, "POST", "/api/users", &[], r#"{"name":"Eve","password":"let me in"}"#).await.0, 401);
-        for open in ["/", "/app.js", "/api/ping", "/api/session", "/logo.png"] {
+        for open in ["/", "/app.js", "/api/ping", "/api/session", "/logo.png", "/api/network"] {
             assert_eq!(call(port, "GET", open, &[], "").await.0, 200, "{open}");
         }
+        let proxied = ["X-Forwarded-For: 203.0.113.9"];
+        assert_eq!(call(port, "GET", "/api/network", &proxied, "").await.0, 401, "local only to the proxy");
         assert_eq!(call(port, "GET", "/api/board", &["Cookie: kanzo_session=made-up"], "").await.0, 401);
         let (status, _, body) = call(port, "GET", "/api/board", &[&ana], "").await;
         assert_eq!(status, 200);

@@ -562,6 +562,39 @@ html:not(.ready) aside { visibility: hidden; }
   .rail .nav .name, .rail .nav .count, .rail .nav .item .more, .rail .nav .label { display: none; }
   .rail .nav .board-sep { margin: 8px 6px; }
 }
+.avatar {
+  width: 20px; height: 20px; border-radius: 50%; flex: none; display: inline-grid; place-items: center; object-fit: cover;
+  color: #fff; font-size: 10px; font-weight: 600; line-height: 1; text-transform: uppercase; user-select: none;
+}
+.avatar.big { width: 56px; height: 56px; font-size: 20px; }
+.card .avatar { margin-top: 1px; }
+.card.row .avatar { margin: 0; }
+#me { margin-top: 2px; color: var(--muted); }
+#me:hover, #me:focus-visible { color: var(--text); }
+#me span { overflow: hidden; text-overflow: ellipsis; }
+.rail #me span { display: none; }
+#login-dialog { z-index: 60; background: var(--bg); align-items: center; padding: 16px; }
+#login { width: min(360px, 100%); }
+#login h2 { display: flex; align-items: center; gap: 10px; }
+#login h2 img { width: 28px; height: 28px; }
+#login .error { color: var(--danger); font-size: 13px; }
+.settings-pane .fields { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settings-pane .fields .field { flex: 1; min-width: 130px; }
+.settings-pane .fields .btn { margin-left: auto; }
+.settings-pane .hint { color: var(--faint); font-size: 12px; }
+.settings-pane .me { display: flex; align-items: center; gap: 14px; }
+.settings-pane .me .text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.settings-pane .me .text .row .btn { margin-left: 0; }
+.user-row { display: flex; align-items: center; gap: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+.user-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-row .name small { color: var(--faint); font-size: 12px; margin-left: 6px; }
+.user-row .btn, .settings-pane .me .btn { padding: 5px 12px; font-size: 13px; }
+.user-row .ghost { width: auto; padding: 6px; color: var(--faint); }
+.user-row .ghost:hover, .user-row .ghost:focus-visible { color: var(--danger); background: var(--danger-bg); }
+.user-row .ghost .icon svg { width: 15px; height: 15px; }
+.secret { display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 12px; background: var(--field); }
+.secret code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; user-select: all; }
+.secret .label { color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -578,6 +611,7 @@ html:not(.ready) aside { visibility: hidden; }
   <button class="ghost update" id="update-shared" hidden><span class="icon" data-icon="update"></span><span id="update-shared-label"></span></button>
   <button class="ghost" id="install" title="Use the board as an app of its own" hidden><span class="icon" data-icon="update"></span>Install app</button>
   <button class="ghost" id="settings" title="Settings" aria-haspopup="menu"><span class="icon" data-icon="settings"></span>Settings</button>
+  <button class="ghost" id="me" title="Your account" hidden></button>
 </aside>
 
 <main>
@@ -621,6 +655,7 @@ html:not(.ready) aside { visibility: hidden; }
     <textarea class="inline title-input" id="p-title" rows="1" spellcheck="false" placeholder="Task title"></textarea>
     <div class="props">
       Status <span><select class="field" id="p-status"></select></span>
+      <div data-prop="assignee" id="p-assignee-row" hidden>Assignee <span><select class="field" id="p-assignee" aria-label="Assignee"></select></span></div>
       <div data-prop="tags">Tags <span><input class="inline" id="p-tags" placeholder="Add tags, like bug, ui" autocomplete="off" spellcheck="false"></span></div>
       <div data-prop="url">URL <span><input class="inline" id="p-url" type="url" placeholder="Add a link, like a pull request" autocomplete="off" spellcheck="false"></span></div>
       <div data-prop="human">Human <span class="human-field"><label class="switch"><input type="checkbox" id="p-human" aria-label="Human task"><span></span></label><span class="hint">Agents skip it</span></span></div>
@@ -656,6 +691,7 @@ html:not(.ready) aside { visibility: hidden; }
     <div class="settings-body">
       <nav id="settings-nav">
         <button class="ghost" data-section="board"><span class="icon" data-icon="board"></span>Board</button>
+        <button class="ghost" data-section="users"><span class="icon" data-icon="human"></span>Users</button>
         <button class="ghost" data-section="sync"><span class="icon" data-icon="sync"></span>Sync</button>
         <button class="ghost" data-section="about"><span class="icon" data-icon="info"></span>About</button>
       </nav>
@@ -676,6 +712,7 @@ html:not(.ready) aside { visibility: hidden; }
         <h3>Task properties</h3>
         <p>Turn one off to hide it on the board and leave it out of what agents get. Nothing is deleted.</p>
       </section>
+      <section class="settings-pane" data-section="users" id="users-pane"></section>
       <form class="settings-pane" data-section="sync" id="sync-form">
         <h3>Sync</h3>
         <p>Keep this board the same on all your machines through a private git repo you own. Use the same repo on each machine.</p>
@@ -715,7 +752,7 @@ html:not(.ready) aside { visibility: hidden; }
       <button class="btn danger" type="button" id="network-leave">Leave</button>
     </div>
     <div class="row" id="network-join-fields">
-      <input class="field" id="join-host" placeholder="192.168.0.12" aria-label="Address of the sharing computer" required autocomplete="off" spellcheck="false">
+      <input class="field" id="join-host" placeholder="192.168.0.12, or token@192.168.0.12" aria-label="Address of the sharing computer" required autocomplete="off" spellcheck="false">
       <button class="btn" type="submit" id="join-submit">Join</button>
     </div>
   </form>
@@ -751,6 +788,17 @@ html:not(.ready) aside { visibility: hidden; }
   </div>
 </div>
 
+<div class="search-dialog" id="login-dialog" hidden>
+  <form class="dialog-window" id="login" role="dialog" aria-modal="true" aria-labelledby="login-title">
+    <h2 id="login-title"><img src="/logo.png" alt="">Sign in to Kanzo</h2>
+    <input class="field" id="login-name" placeholder="Name" aria-label="Name" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    <input class="field" id="login-password" type="password" placeholder="Password" aria-label="Password" autocomplete="current-password" required>
+    <p class="error" id="login-error" hidden></p>
+    <div class="row">
+      <button class="btn primary" type="submit" id="login-submit">Sign in</button>
+    </div>
+  </form>
+</div>
 <div class="offline" id="offline" hidden>Board not reachable — is kanzo running?</div>
 
 <script src="/app.js"></script>

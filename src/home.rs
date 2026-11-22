@@ -19,8 +19,9 @@ port = 4242
 
 # Address the board listens on. 127.0.0.1 keeps it on this machine. Use
 # "0.0.0.0" to open it from other devices, for example when Kanzo runs on a
-# Raspberry Pi with no screen. There are no logins: anyone who can reach the
-# port can read and change the board, and use its MCP endpoint.
+# Raspberry Pi with no screen. Until the board has users (Settings, Users),
+# anyone who can reach the port can read and change the board, and use its
+# MCP endpoint.
 listen = "127.0.0.1"
 
 # Also serve MCP over HTTP at http://localhost:<port>/mcp, for agents
