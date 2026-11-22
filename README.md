@@ -161,6 +161,7 @@ The board's filter (`f`), search (`/`) and the `filter` of `list_tasks` and `nex
 | `title:`, `description:`, `url:`, `comment:` | text in that field | `title:login`, `comment:"on hold"` |
 | `id:`, `comments:`, `images:` | a number, or a range | `id:12`, `comments:>2`, `images:1..3` |
 | `created:`, `updated:` | a date, or a range | `created:2026-11-05`, `updated:<2026-01-31` |
+| `assignee:` | tasks assigned to that user | `assignee:ana`, `no:assignee` |
 | `is:human` | tasks for you, not agents | `-is:human` |
 | `is:waiting` | tasks waiting on unfinished ones | `-is:waiting` |
 | `has:`, `no:` | `description`, `tags`, `url`, `comments` or `images` | `has:url`, `no:tags` |
@@ -222,7 +223,39 @@ flowchart LR
   net -- VPN --> pi["🍓 Raspberry Pi<br><i>100.101.32.7</i><br><code>kanzo#nbsp;share#nbsp;on</code>"]
 ```
 
-On a Pi, `kanzo service install` keeps the board running after a restart. There are no logins: share only on a network you trust.
+On a Pi, `kanzo service install` keeps the board running after a restart. Until the board has users, anyone who can reach it can change it: share it only on a network you trust, or [add accounts](#accounts).
+
+## Accounts
+
+> [!NOTE]
+> Accounts are what this fork adds to [Kanzo](https://github.com/emanuele-em/kanzo).
+
+A board has no logins until you want them. In Settings, choose Users and create the first account. From then on the board asks everyone to sign in, and that first account is an admin, who adds and removes the others.
+
+- **Assign tasks:** pick a user in a task's panel, and their picture shows on its card. Filter with `assignee:ana`, `has:assignee` or `no:assignee`. Agents pass `assignee`.
+- **Profile pictures:** in Settings, under Users, add a picture. It shows on your tasks and beside your comments.
+- **Comments** are signed with the name of the user who wrote them.
+- **Agents and other computers** sign in with an access token. Create one in Settings, under Users. The board shows it once, with the two lines that use it:
+
+```sh
+claude mcp add kanzo --scope user --transport http http://192.168.1.20:4242/mcp --header "Authorization: Bearer kz_…"
+kanzo join kz_…@192.168.1.20
+```
+
+What an agent does with your token is recorded under your name, and `next_task` leaves it the tasks assigned to someone else. `kanzo mcp`, started on the computer that holds the board, needs no token.
+
+Forgot a password? On the board's computer, `kanzo user password <name>` sets a new one. `kanzo user list`, `add` and `remove` manage the rest, and removing the last user makes the board open again.
+
+Passwords are stored as salted PBKDF2 hashes, and sessions and tokens as SHA-256 digests. The board itself is plain HTTP, so over the internet reach it through a VPN, as for sharing.
+
+### Docker
+
+```sh
+docker build -t kanzo https://github.com/cristianlanderos/kanzo.git
+docker run -d --name kanzo --restart unless-stopped -p 4242:4242 -v kanzo-data:/data kanzo
+```
+
+The image keeps the board in `/data` and listens on every address, so add the first user as soon as it is up.
 
 ### Sync it between machines
 
@@ -248,6 +281,7 @@ From then on, choose Sync, or run `kanzo sync`, when you switch machines. It com
 | `kanzo join <ip>` | Uses the board another computer shares, from this one's board and agents; `kanzo leave` goes back |
 | `kanzo sync` | Commits the board and pulls or pushes it; `--repo <url>` sets the repo, `--keep-local` or `--keep-remote` when both sides changed |
 | `kanzo export` | Prints the board as Markdown; `-f json` for JSON, `-p <project>` for one project, `-o <file>` to save it |
+| `kanzo user list` | Lists the board's users; `add <name>`, `password <name>` and `remove <name>` manage them from the board's computer |
 | `kanzo update` | Installs the latest release and restarts the board's service; the board offers new versions too |
 | `kanzo init` | Creates the data folder; the first run does this too |
 | `kanzo --version` | Prints the version |

@@ -38,6 +38,9 @@ const state = {
   guests: null,
   selected: new Set(),
   sweeping: false,
+  // Whether this computer's board has users, and which of them this browser is signed in as.
+  accounts: false,
+  me: null,
 };
 
 // A joined board's page reaches the shared board under /remote.
@@ -52,9 +55,36 @@ async function api(method, path, body, board) {
   });
   noticeVersion(res.headers.get("x-kanzo-version"));
   const data = await res.json().catch(() => ({}));
+  // The session ran out, or the board got its first user: ask who this is. Not for the
+  // shared board, which a joined computer signs in to with its token.
+  if (res.status === 401 && data.login && base(board) === "") showLogin();
   if (!res.ok) throw Object.assign(new Error(data.error || res.statusText), { data });
   return data;
 }
+
+// The board waits behind the sign-in, and comes back whole by reloading once it's through.
+function showLogin() {
+  const dialog = $("#login-dialog");
+  if (!dialog.hidden) return;
+  dialog.hidden = false;
+  $("#login-name").focus();
+}
+
+$("#login").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const error = $("#login-error"), submit = $("#login-submit");
+  error.hidden = true;
+  submit.disabled = true;
+  try {
+    await api("POST", "/session", { name: $("#login-name").value, password: $("#login-password").value }, "local");
+    location.reload();
+  } catch (err) {
+    error.textContent = err.message;
+    error.hidden = false;
+    submit.disabled = false;
+    $("#login-password").select();
+  }
+});
 
 // An update restarts the board under the page, which then reloads to match it. Not while
 // someone types, though: the next reply tries again.
@@ -176,6 +206,21 @@ const ICONS = {
   comment: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 13.5 6.8 4M15.4 6.5l-6.8 4"/>',
 };
+
+// A user's picture, or their initials on a colour of their own.
+function avatar(user, big, board = state.on) {
+  const cls = "avatar" + (big ? " big" : "");
+  if (user.avatar) return el("img", { class: cls, src: `${base(board)}/images/${user.avatar}`, alt: "", title: user.name, draggable: "false" });
+  const words = user.name.trim().split(/\s+/);
+  const initials = [...words[0]][0] + (words.length > 1 ? [...words[words.length - 1]][0] : "");
+  let hue = 0;
+  for (const c of user.name.toLowerCase()) hue = (hue * 31 + c.codePointAt(0)) % 360;
+  return el("span", { class: cls, style: `background:hsl(${hue},45%,45%)`, title: user.name }, initials);
+}
+
+// The users of the board on screen. A board without accounts, or on an older version, has none.
+const usersOf = () => state.board?.users || [];
+const userById = (id) => usersOf().find((u) => u.id === id);
 
 function icon(name, color) {
   const span = el("span", { class: "icon", style: color ? `color:${color}` : null });
@@ -917,13 +962,13 @@ const inRange = (side) => (v) => {
   const ends = v.split("..");
   return ends.length > 1 ? ends.length === 2 && ends.every(side) : side(v.replace(/^(>=|<=|>|<)/, ""));
 };
-const isField = (v) => ["description", "tags", "url", "comments", "images"].includes(v);
+const isField = (v) => ["description", "tags", "url", "comments", "images", "assignee"].includes(v);
 // What the server takes as each qualifier's value: anything else makes it a plain word.
 const QUALIFIERS = new Map([
   ["tag", anyText], ["status", anyText], ["project", anyText], ["title", anyText], ["description", anyText],
   ["url", anyText], ["comment", anyText], ["id", inRange(isNumber)], ["comments", inRange(isNumber)],
   ["images", inRange(isNumber)], ["created", inRange(isDate)], ["updated", inRange(isDate)],
-  ["is", (v) => v === "human" || v === "waiting"], ["has", isField], ["no", isField],
+  ["is", (v) => v === "human" || v === "waiting"], ["has", isField], ["no", isField], ["assignee", anyText],
 ]);
 
 // A part of a query, read as the server reads it. Null for a word.
@@ -1139,6 +1184,7 @@ function card(t, showProject, row) {
     el("div", { class: "head" },
       el("div", { class: "title" }, t.title),
       t.human ? el("span", { class: "human-mark", title: tr("Human task: agents skip it") }, icon("human")) : null,
+      t.assignee && userById(t.assignee) ? avatar(userById(t.assignee)) : null,
       el("span", { class: "num", title: tr("Copy {0}", key(t)), onclick: (e) => { e.stopPropagation(); copyKey(key(t)); } },
         showProject ? el("span", { class: "dot", style: `background:${projectColor(t.project)}` }) : null, `#${t.id}`)),
     ...summary(t, waitChip(t), urlChip(t)).slice(row ? 1 : 0));
@@ -1391,6 +1437,12 @@ async function refreshTask() {
   if (!statuses.includes(task.status)) status.append(el("option", { value: task.status }, task.status));
   status.value = task.status;
   $("#p-human").checked = task.human;
+  const assignee = $("#p-assignee");
+  $("#p-assignee-row").hidden = !usersOf().length;
+  if (document.activeElement !== assignee) {
+    assignee.replaceChildren(el("option", { value: "0" }, tr("Nobody")), ...usersOf().map((u) => el("option", { value: u.id }, u.name)));
+    assignee.value = String(task.assignee || 0);
+  }
   $("#p-waits-links").replaceChildren(...waits_on.map(taskLink));
   $("#p-blocks").replaceChildren(...blocks.map(taskLink));
   $("#p-blocks-row").hidden = !blocks.length;
@@ -1406,13 +1458,23 @@ async function refreshTask() {
     body.innerHTML = markdown(c.body);
     const attached = images.filter((i) => i.comment_id === c.id);
     return el("div", { class: "comment" },
-      el("div", { class: "who" }, el("b", {}, c.author), " · ", timeEl(c.created_at),
+      el("div", { class: "who" }, ...commentBy(c), " · ", timeEl(c.created_at),
         el("button", { class: "remove", title: tr("Delete comment"), "aria-label": tr("Delete comment"),
                        onclick: () => deleteComment(c) }, icon("trash"))),
       c.body ? body : null,
       attached.length ? el("div", { class: "thumbs" }, attached.map((i) => thumb(i.file))) : null);
   }));
 }
+
+// A user's comment carries their picture. An agent's is signed with its own name, then whose token it used.
+function commentBy(c) {
+  const user = c.user_id && userById(c.user_id);
+  if (!user) return [el("b", {}, c.author)];
+  if (c.author === user.name) return [avatar(user), el("b", {}, user.name)];
+  return [avatar(user), el("b", {}, c.author), " · ", tr("for {0}", user.name)];
+}
+
+$("#p-assignee").addEventListener("change", (e) => patchTask({ assignee: Number(e.target.value) }));
 
 async function deleteComment(c) {
   if (!(await ask(tr("Delete this comment? This cannot be undone.")))) return;
@@ -1562,6 +1624,11 @@ function imagesIn(transfer) {
 
 async function uploadImage(image) {
   return (await api("POST", "/images", image)).file;
+}
+
+// To this computer's board, whichever is on screen: that is where a profile picture lives.
+async function uploadImageTo(image) {
+  return (await api("POST", "/images", image, "local")).file;
 }
 
 async function attachImages(images, toComment) {
@@ -2096,6 +2163,7 @@ function openSettings(section = "board") {
   $("#sync-create").hidden = !!syncRemote;
   $("#sync-error").hidden = true;
   $("#settings-version").textContent = state.board ? `Kanzo ${state.board.version}` : "";
+  renderUsers();
   showSection(section);
   $("#settings-dialog").hidden = false;
   if (section === "sync") $("#sync-url").focus();
@@ -2160,6 +2228,160 @@ $('.settings-pane[data-section="board"]').append(...["Description", "Tags", "URL
     pane.querySelector(".setting"));
 }
 $("#settings-update").addEventListener("click", checkForUpdates);
+
+// The Users page of Settings: this browser's account, its access tokens and, for an admin,
+// everyone else. Always about this computer's board, whichever one is on screen.
+let newToken = null;
+
+async function account(method, path, body) {
+  try {
+    return await api(method, path, body, "local");
+  } catch (err) { toast(err.message); return null; }
+}
+
+function passwordField(placeholder, current) {
+  return el("input", { class: "field", type: "password", placeholder: tr(placeholder), "aria-label": tr(placeholder),
+                       autocomplete: current ? "current-password" : "new-password", required: true, minlength: current ? null : "8" });
+}
+
+// Squared and shrunk in the browser, so a phone's photo costs the board a few kilobytes.
+function squarePicture(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(tr("Can't read that image")));
+    reader.onload = () => {
+      const image = new Image();
+      image.onerror = () => reject(new Error(tr("Can't read that image")));
+      image.onload = () => {
+        const size = 256, side = Math.min(image.width, image.height);
+        const canvas = el("canvas", { width: size, height: size });
+        const draw = canvas.getContext("2d");
+        draw.fillStyle = "#fff";
+        draw.fillRect(0, 0, size, size);
+        draw.drawImage(image, (image.width - side) / 2, (image.height - side) / 2, side, side, 0, 0, size, size);
+        canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error(tr("Can't read that image"))), "image/jpeg", 0.9);
+      };
+      image.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function renderUsers() {
+  const pane = $("#users-pane");
+  if (!state.accounts) {
+    const name = el("input", { class: "field", placeholder: tr("Name"), "aria-label": tr("Name"), autocomplete: "username", required: true, maxlength: "40" });
+    const password = passwordField("Password, 8 characters or more");
+    pane.replaceChildren(
+      el("h3", {}, tr("Users")),
+      el("p", {}, tr("Anyone who can reach this board can read and change it. Create the first account, and from then on the board asks everyone to sign in.")),
+      el("form", { class: "fields", onsubmit: async (e) => {
+        e.preventDefault();
+        if (await account("POST", "/users", { name: name.value, password: password.value })) location.reload();
+      } }, name, password, el("button", { class: "btn primary", type: "submit" }, tr("Create account"))),
+      el("p", { class: "hint" }, tr("This account is an admin: it adds and removes the other users. A forgotten password is reset on the board's computer, with kanzo user password.")));
+    return;
+  }
+  const me = state.me;
+  if (!me) { pane.replaceChildren(); return; }
+  const [users, tokens] = await Promise.all([account("GET", "/users"), account("GET", "/tokens")]);
+  if (!users || !tokens) return;
+  const reload = async (user) => {
+    if (user && user.id === me.id) { state.me = user; renderMe(); }
+    await renderUsers();
+    loadBoard();
+  };
+
+  const file = el("input", { type: "file", accept: "image/*", hidden: true, onchange: async () => {
+    if (!file.files[0]) return;
+    try {
+      const picture = await uploadImageTo(await squarePicture(file.files[0]));
+      reload(await account("PATCH", `/users/${me.id}`, { avatar: picture }));
+    } catch (err) { toast(err.message); }
+  } });
+  const name = el("input", { class: "field", value: me.name, "aria-label": tr("Your name"), maxlength: "40", autocomplete: "off",
+    onkeydown: (e) => { if (e.key === "Enter") name.blur(); },
+    onblur: async () => {
+      if (name.value.trim() && name.value.trim() !== me.name) reload(await account("PATCH", `/users/${me.id}`, { name: name.value }));
+      else name.value = me.name;
+    } });
+  const current = passwordField("Current password", true), fresh = passwordField("New password");
+  const token = el("input", { class: "field", placeholder: tr("What uses it, like Claude Code"), "aria-label": tr("Token name"), required: true, maxlength: "60" });
+  const address = location.host;
+  const shown = newToken && el("div", { class: "secret" },
+    el("span", { class: "label" }, tr("Copy this token now. The board does not show it again.")),
+    el("code", {}, newToken),
+    el("span", { class: "label" }, tr("For Claude Code:")),
+    el("code", {}, `claude mcp add kanzo --scope user --transport http http://${address}/mcp --header "Authorization: Bearer ${newToken}"`),
+    el("span", { class: "label" }, tr("For another computer that runs Kanzo:")),
+    el("code", {}, `kanzo join ${newToken}@${address}`));
+
+  const newName = el("input", { class: "field", placeholder: tr("Name"), "aria-label": tr("Name"), required: true, maxlength: "40", autocomplete: "off" });
+  const newPassword = passwordField("Password, 8 characters or more");
+  const others = users.map((u) => el("div", { class: "user-row" }, avatar(u, false, "local"),
+    el("span", { class: "name" }, u.name, u.id === me.id ? el("small", {}, tr("you")) : null, u.admin ? el("small", {}, tr("admin")) : null),
+    me.admin && u.id !== me.id ? [
+      el("button", { class: "btn", type: "button", onclick: async () => reload(await account("PATCH", `/users/${u.id}`, { admin: !u.admin })) },
+        u.admin ? tr("Remove admin") : tr("Make admin")),
+      el("button", { class: "btn", type: "button", onclick: async () => {
+        const password = prompt(tr("A new password for {0}, 8 characters or more. They are signed out everywhere.", u.name));
+        if (password && await account("PATCH", `/users/${u.id}`, { password })) toast(tr("Password changed"));
+      } }, tr("Reset password")),
+      el("button", { class: "ghost", type: "button", title: tr("Remove {0}", u.name), "aria-label": tr("Remove {0}", u.name), onclick: async () => {
+        if (!(await ask(tr("Remove {0}? Their tasks and comments stay. This cannot be undone.", u.name)))) return;
+        if (await account("DELETE", `/users/${u.id}`)) reload();
+      } }, icon("trash")),
+    ] : null));
+
+  // replaceChildren would print a missing part as the word "null".
+  pane.replaceChildren(...[
+    el("h3", {}, tr("Your account")),
+    el("div", { class: "me" }, avatar(me, true, "local"),
+      el("div", { class: "text" }, name,
+        el("div", { class: "row" },
+          el("button", { class: "btn", type: "button", onclick: () => file.click() }, me.avatar ? tr("Change picture") : tr("Add a picture")),
+          me.avatar ? el("button", { class: "btn", type: "button", onclick: async () => reload(await account("PATCH", `/users/${me.id}`, { avatar: null })) }, tr("Remove picture")) : null,
+          el("button", { class: "btn", type: "button", onclick: async () => { await account("DELETE", "/session"); location.reload(); } }, tr("Sign out")))),
+      file),
+    el("form", { class: "fields", onsubmit: async (e) => {
+      e.preventDefault();
+      if (await account("PATCH", `/users/${me.id}`, { password: fresh.value, current_password: current.value })) {
+        current.value = fresh.value = "";
+        toast(tr("Password changed"));
+      }
+    } }, current, fresh, el("button", { class: "btn", type: "submit" }, tr("Change password"))),
+
+    el("h3", {}, tr("Access tokens")),
+    el("p", {}, tr("An agent or another computer signs in as you with a token. What it does on the board is recorded under your name.")),
+    shown,
+    ...tokens.map((t) => el("div", { class: "user-row" }, el("span", { class: "name" }, t.name, el("small", {}, ago(t.created_at))),
+      el("button", { class: "ghost", type: "button", title: tr("Delete token"), "aria-label": tr("Delete token"), onclick: async () => {
+        if (!(await ask(tr("Delete the token {0}? Whatever uses it is signed out.", t.name)))) return;
+        if (await account("DELETE", `/tokens/${t.id}`)) renderUsers();
+      } }, icon("trash")))),
+    el("form", { class: "fields", onsubmit: async (e) => {
+      e.preventDefault();
+      const made = await account("POST", "/tokens", { name: token.value });
+      if (made) { newToken = made.token; renderUsers(); }
+    } }, token, el("button", { class: "btn", type: "submit" }, tr("Create token"))),
+
+    el("h3", {}, tr("Users")),
+    ...others,
+    me.admin ? el("form", { class: "fields", onsubmit: async (e) => {
+      e.preventDefault();
+      if (await account("POST", "/users", { name: newName.value, password: newPassword.value })) reload();
+    } }, newName, newPassword, el("button", { class: "btn", type: "submit" }, tr("Add user"))) : null,
+  ].filter(Boolean));
+}
+
+// The signed-in user at the foot of the sidebar; a click opens their account.
+function renderMe() {
+  const button = $("#me");
+  button.hidden = !state.me;
+  if (state.me) button.replaceChildren(avatar(state.me, false, "local"), el("span", {}, state.me.name));
+}
+
+$("#me").addEventListener("click", () => openSettings("users"));
 
 async function checkUpdate() {
   try {
@@ -2294,8 +2516,15 @@ function walkStatic() {
   }
 }
 
-loadDictionary().then(() => {
+loadDictionary().then(async () => {
   walkStatic();
+  // Who this is comes first: a board with users shows nothing until someone signs in.
+  // A board from before accounts has no such page, and is open.
+  const session = await api("GET", "/session", null, "local").catch(() => ({}));
+  state.accounts = !!session.accounts;
+  state.me = session.user || null;
+  renderMe();
+  if (state.accounts && !state.me) { showLogin(); return; }
   checkUpdate();
   setInterval(checkUpdate, 24 * 60 * 60 * 1000);
   loadSyncRemote();

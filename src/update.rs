@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
-const RELEASES: &str = "https://github.com/emanuele-em/kanzo/releases/latest/download";
+/// This fork's releases. The original's builds know nothing of accounts: one installed over
+/// this would run a board with users as an open one.
+const RELEASES: &str = "https://github.com/cristianlanderos/kanzo/releases/latest/download";
 
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 

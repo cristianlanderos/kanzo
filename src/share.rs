@@ -42,7 +42,8 @@ impl Net {
         match text.trim() {
             "share" => Net::Sharing,
             line => match line.strip_prefix("join ") {
-                Some(host) => Net::Joined(host.trim().to_string()),
+                // After the host comes the access token, when the shared board has accounts.
+                Some(host) => Net::Joined(host.split_whitespace().next().unwrap_or_default().to_string()),
                 // config.toml can keep the board on the network for good, as before `kanzo share`.
                 None if !home.config.listen.is_loopback() => Net::Sharing,
                 None => Net::Private,
@@ -50,15 +51,69 @@ impl Net {
         }
     }
 
-    fn save(&self, home: &Home) -> io::Result<()> {
+    fn save(&self, home: &Home, token: Option<&str>) -> io::Result<()> {
         let path = home.dir.join(FILE);
         match self {
             Net::Private => std::fs::remove_file(path)
                 .or_else(|e| if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) }),
             Net::Sharing => std::fs::write(path, "share\n"),
-            Net::Joined(host) => std::fs::write(path, format!("join {host}\n")),
+            Net::Joined(host) => {
+                let token = token.map(|t| format!(" {t}")).unwrap_or_default();
+                write_private(&path, &format!("join {host}{token}\n"))
+            }
         }
     }
+}
+
+/// The file can hold an access token, so on Unix only its owner reads it.
+fn write_private(path: &Path, text: &str) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    io::Write::write_all(&mut options.open(path)?, text.as_bytes())
+}
+
+/// The access token this computer joined a board with accounts with.
+pub fn token(home: &Home) -> Option<String> {
+    let text = std::fs::read_to_string(home.dir.join(FILE)).ok()?;
+    text.trim().strip_prefix("join ")?.split_whitespace().nth(1).map(String::from)
+}
+
+/// `host` as typed: an address, or `token@address` for a board with accounts.
+fn split_token(host: &str) -> (Option<&str>, &str) {
+    match host.trim().rsplit_once('@') {
+        Some((token, address)) if crate::auth::is_token(token) => (Some(token), address),
+        _ => (None, host),
+    }
+}
+
+/// Asks the board at `host` whether it lets this computer in, with the token or without.
+async fn access(host: &str, token: Option<&str>) -> Result<(), String> {
+    let bearer = token.map(|t| format!("Bearer {t}"));
+    let headers: Vec<(&str, &str)> = bearer.iter().map(|b| ("authorization", b.as_str())).collect();
+    let ask = async {
+        let mut reply = send(host, "GET", "/api/session", &headers, b"").await.ok()?;
+        let mut body = String::new();
+        reply.body.read_to_string(&mut body).await.ok()?;
+        // A board from before accounts has no such page, and no logins either.
+        (reply.status == 200).then(|| serde_json::from_str::<Value>(&body).ok()).flatten()
+    };
+    let Some(session) = tokio::time::timeout(Duration::from_secs(3), ask).await.ok().flatten() else {
+        return Ok(());
+    };
+    if session["accounts"] != true || !session["user"].is_null() {
+        return Ok(());
+    }
+    Err(match token {
+        Some(_) => format!("The board at {host} doesn't know that access token: make a new one there, in Settings."),
+        None => format!(
+            "The board at {host} has accounts. Make an access token there, in Settings, and join with it: kanzo join <token>@{host}"
+        ),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,6 +127,7 @@ pub enum Change {
 
 pub async fn change(home: &Home, change: Change) -> Result<Net, String> {
     let now = Net::load(home);
+    let mut token = None;
     let next = match (change, &now) {
         (Change::On, Net::Joined(host)) => {
             return Err(format!("This computer uses the board at {host}: run kanzo leave first."));
@@ -87,17 +143,20 @@ pub async fn change(home: &Home, change: Change) -> Result<Net, String> {
         (Change::Off | Change::Leave, _) => now.clone(),
         (Change::Join(_), Net::Sharing) => return Err("This board is shared: run kanzo share off first.".into()),
         (Change::Join(host), _) => {
-            let host = address(&host)?;
+            let (given, host) = split_token(&host);
+            token = given.map(String::from);
+            let host = address(host)?;
             if !is_kanzo(&host).await {
                 return Err(format!(
                     "No shared board at {host}: share it on that computer first, on the same network."
                 ));
             }
+            access(&host, token.as_deref()).await?;
             Net::Joined(host)
         }
     };
-    if next != now {
-        next.save(home).map_err(|e| format!("cannot save {FILE}: {e}"))?;
+    if next != now || token.is_some() {
+        next.save(home, token.as_deref()).map_err(|e| format!("cannot save {FILE}: {e}"))?;
     }
     Ok(next)
 }
@@ -281,13 +340,26 @@ fn unreachable(host: &str) -> String {
     format!("The shared board at {host} isn't reachable; run kanzo leave to use this computer's board.")
 }
 
-pub async fn forward(host: &str, req: Request) -> Response {
+/// `token` signs this computer in to a shared board with accounts. What the browser sent to
+/// sign in to this board stays here.
+pub async fn forward(host: &str, token: Option<&str>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let Ok(body) = axum::body::to_bytes(body, BODY_LIMIT).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
     // The host checks its own Host; the page's Origin is this board's, checked already.
-    let skip = ["host", "origin", "referer", "connection", "content-length", "transfer-encoding", "keep-alive"];
+    let skip = [
+        "host",
+        "origin",
+        "referer",
+        "connection",
+        "content-length",
+        "transfer-encoding",
+        "keep-alive",
+        "cookie",
+        "authorization",
+    ];
+    let bearer = token.map(|t| format!("Bearer {t}"));
     let mut headers: Vec<(&str, &str)> = parts
         .headers
         .iter()
@@ -295,6 +367,9 @@ pub async fn forward(host: &str, req: Request) -> Response {
         .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)))
         .collect();
     headers.push((COMPUTER_HEADER, computer()));
+    if let Some(bearer) = &bearer {
+        headers.push(("authorization", bearer));
+    }
     let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
     let Ok(reply) = send(host, parts.method.as_str(), path, &headers, &body).await else {
         return crate::web::fail(StatusCode::BAD_GATEWAY, unreachable(host)).into_response();
@@ -323,6 +398,8 @@ pub fn handshake(initialized: Option<&ClientConfig>, meta: &RequestMetaObject) -
 
 pub struct Upstream {
     host: String,
+    /// `Bearer` and the access token, for a shared board with accounts.
+    bearer: Option<String>,
     session: Option<String>,
     folder: String,
     repos: String,
@@ -330,13 +407,15 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn new(host: String, folder: &Path, repos: &[String], images: &Path) -> Self {
+    pub fn new(host: String, token: Option<String>, folder: &Path, repos: &[String], images: &Path) -> Self {
         let folder = folder.display().to_string();
-        Self { host, session: None, folder, repos: repos.join(","), images: images.to_path_buf() }
+        let bearer = token.map(|t| format!("Bearer {t}"));
+        Self { host, bearer, session: None, folder, repos: repos.join(","), images: images.to_path_buf() }
     }
 
-    pub fn host(&self) -> &str {
-        &self.host
+    /// Whether it still talks to the board, and as the user, that this computer joined.
+    pub fn is(&self, host: &str, token: Option<&str>) -> bool {
+        self.host == host && self.bearer.as_deref().and_then(|b| b.strip_prefix("Bearer ")) == token
     }
 
     pub async fn call(
@@ -388,7 +467,8 @@ impl Upstream {
             if !crate::store::valid_image_file(&file) || path.exists() {
                 continue;
             }
-            let Ok(mut reply) = send(&self.host, "GET", &format!("/images/{file}"), &[], b"").await else { continue };
+            let auth: Vec<(&str, &str)> = self.bearer.iter().map(|b| ("authorization", b.as_str())).collect();
+            let Ok(mut reply) = send(&self.host, "GET", &format!("/images/{file}"), &auth, b"").await else { continue };
             let mut bytes = Vec::new();
             if reply.status == 200 && reply.body.read_to_end(&mut bytes).await.is_ok() {
                 let _ = crate::home::write_whole(&path, &bytes);
@@ -408,6 +488,9 @@ impl Upstream {
         ];
         if let Some(id) = &self.session {
             headers.push(("mcp-session-id", id));
+        }
+        if let Some(bearer) = &self.bearer {
+            headers.push(("authorization", bearer));
         }
         let mut reply = send(&self.host, "POST", "/mcp", &headers, line.as_bytes()).await?;
         if let Some(id) = reply.header("mcp-session-id") {

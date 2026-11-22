@@ -16,9 +16,10 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::{self, Who};
 use crate::home::Home;
 use crate::share::{self, Change, Net};
-use crate::store::{self, Error, ImagesOf, Store, TaskPatch};
+use crate::store::{self, Error, ImagesOf, Store, TaskPatch, User, UserPatch};
 use crate::{sync, update};
 
 const INDEX: &str = include_str!("index.html");
@@ -37,7 +38,7 @@ const CSP: &str = "default-src 'none'; script-src 'self' 'sha256-qbmIwOLWfXjTJcv
 
 pub async fn serve(home: Home, open: bool) -> Result<()> {
     let port = home.config.port;
-    let guard = Arc::new(Guard::new(port, home.config.listen, Net::load(&home)));
+    let guard = Arc::new(Guard::new(port, home.config.listen, Net::load(&home)).with_token(share::token(&home)));
     let url = format!("http://localhost:{port}");
     let listener = match TcpListener::bind(SocketAddr::new(guard.address(), port)).await {
         Ok(l) => l,
@@ -61,7 +62,13 @@ pub async fn serve(home: Home, open: bool) -> Result<()> {
         Net::Joined(host) => println!("It also shows the board at {host}."),
         _ => {
             println!("{}", guard.status().message());
-            println!("Anyone who can reach port {port} can read and change this board.");
+            if home.store().and_then(|s| s.has_users()).unwrap_or(false) {
+                println!("It asks everyone to sign in.");
+            } else {
+                println!(
+                    "Anyone who can reach port {port} can read and change this board: add a user in Settings to ask for a login."
+                );
+            }
         }
     }
     if home.config.mcp_http {
@@ -201,7 +208,13 @@ fn router(home: Home, guard: Arc<Guard>, shutdown: CancellationToken) -> Router 
         .route("/api/images/{id}", delete(delete_image))
         .route("/api/tasks/{id}/images", post(attach_image))
         .route("/api/sync", get(sync_status).post(sync_now).put(sync_repo))
-        .route("/api/settings", patch(update_settings));
+        .route("/api/settings", patch(update_settings))
+        .route("/api/session", get(session).post(sign_in).delete(sign_out))
+        .route("/api/users", get(users).post(create_user))
+        .route("/api/users/{id}", patch(update_user).delete(delete_user))
+        .route("/api/tokens", get(tokens).post(create_token))
+        .route("/api/tokens/{id}", delete(delete_token));
+    let auth = Arc::new(Auth::new(home.clone()));
     Router::new()
         .route("/", get(|| async { Html(INDEX) }))
         .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], APP_JS) }))
@@ -225,6 +238,9 @@ fn router(home: Home, guard: Arc<Guard>, shutdown: CancellationToken) -> Router 
         .merge(board)
         .merge(agents)
         .layer(Extension(guard.clone()))
+        .layer(Extension(auth.clone()))
+        // Inside `protect`: a request from another site never gets as far as a login.
+        .layer(middleware::from_fn_with_state(auth, authenticate))
         .layer(middleware::from_fn_with_state(guard, protect))
         .layer(middleware::map_response(stamp_version))
         .with_state(Arc::new(home))
@@ -243,6 +259,8 @@ struct Guard {
     port: u16,
     listen: IpAddr,
     net: Mutex<Net>,
+    /// The access token this board joined a board with accounts with.
+    token: Mutex<Option<String>>,
     guests: Mutex<HashMap<IpAddr, (Instant, Option<String>)>>,
     names: OnceLock<Vec<String>>,
     rebind: Mutex<CancellationToken>,
@@ -257,6 +275,7 @@ impl Guard {
             port,
             listen,
             net: Mutex::new(net),
+            token: Mutex::default(),
             guests: Mutex::default(),
             names: OnceLock::new(),
             rebind: Mutex::default(),
@@ -265,6 +284,15 @@ impl Guard {
 
     fn net(&self) -> Net {
         self.net.lock().unwrap().clone()
+    }
+
+    fn token(&self) -> Option<String> {
+        self.token.lock().unwrap().clone()
+    }
+
+    fn with_token(self, token: Option<String>) -> Self {
+        *self.token.lock().unwrap() = token;
+        self
     }
 
     fn lan(&self) -> bool {
@@ -342,7 +370,7 @@ fn guest(req: &Request) -> Option<IpAddr> {
 
 async fn forward(State(guard): State<Arc<Guard>>, req: Request, next: Next) -> Response {
     match guard.net() {
-        Net::Joined(host) => share::forward(&host, req).await,
+        Net::Joined(host) => share::forward(&host, guard.token().as_deref(), req).await,
         _ => next.run(req).await,
     }
 }
@@ -358,7 +386,7 @@ async fn remote(Extension(guard): Extension<Arc<Guard>>, mut req: Request) -> Re
         Ok(uri) => *req.uri_mut() = uri,
         Err(e) => return fail(StatusCode::BAD_REQUEST, e).into_response(),
     }
-    share::forward(&host, req).await
+    share::forward(&host, guard.token().as_deref(), req).await
 }
 
 async fn this_computer(req: Request, next: Next) -> Response {
@@ -409,18 +437,23 @@ async fn with_store<T: Serialize + Send + 'static>(
     home: Arc<Home>,
     f: impl FnOnce(&Home, &Store) -> store::Result<T> + Send + 'static,
 ) -> Response {
-    let error = match blocking(move || f(&home, &home.store()?)).await {
-        Ok(Ok(v)) => return Json(v).into_response(),
-        Ok(Err(e)) => e,
-        Err(e) => return e.into_response(),
-    };
-    let code = match error {
-        Error::NotFound(_) => StatusCode::NOT_FOUND,
-        Error::Invalid(_) => StatusCode::BAD_REQUEST,
-        Error::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
-        Error::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    fail(code, error).into_response()
+    match blocking(move || f(&home, &home.store()?)).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => Fail::from(e).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+impl From<Error> for Fail {
+    fn from(error: Error) -> Self {
+        let code = match error {
+            Error::NotFound(_) => StatusCode::NOT_FOUND,
+            Error::Invalid(_) => StatusCode::BAD_REQUEST,
+            Error::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        fail(code, error)
+    }
 }
 
 type Reply = Result<Response, Fail>;
@@ -493,6 +526,9 @@ struct Board {
     projects: Vec<store::Project>,
     statuses: Vec<String>,
     tasks: Vec<store::Task>,
+    /// To name and picture assignees and comment authors. Left out on a board without accounts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    users: Vec<User>,
     version: &'static str,
 }
 
@@ -515,6 +551,7 @@ async fn board(State(home): Shared, Query(q): Query<BoardQuery>) -> Response {
             projects: s.list_projects()?,
             statuses: s.statuses().to_vec(),
             tasks,
+            users: s.list_users()?,
             version: update::CURRENT,
         })
     })
@@ -598,12 +635,14 @@ struct NewTask {
     project: String,
     title: String,
     description: Option<String>,
+    assignee: Option<i64>,
 }
 
 async fn create_task(State(home): Shared, Json(t): Json<NewTask>) -> Response {
     with_store(home, move |_, s| {
         let project = s.find_project(&t.project)?;
-        s.create_task_in(project.id, &t.title, TaskPatch { description: t.description, ..Default::default() })
+        let patch = TaskPatch { description: t.description, assignee: t.assignee, ..Default::default() };
+        s.create_task_in(project.id, &t.title, patch)
     })
     .await
 }
@@ -655,6 +694,8 @@ struct Patch {
     human: Option<bool>,
     url: Option<String>,
     waits_on: Option<String>,
+    /// A user's id; 0 assigns the task to nobody.
+    assignee: Option<i64>,
 }
 
 async fn update_task(State(home): Shared, Path(id): Path<i64>, Json(p): Json<Patch>) -> Response {
@@ -671,6 +712,7 @@ async fn update_task(State(home): Shared, Path(id): Path<i64>, Json(p): Json<Pat
                 human: p.human,
                 url: p.url,
                 waits_on: p.waits_on,
+                assignee: p.assignee,
             },
         )
     })
@@ -733,12 +775,18 @@ struct NewComment {
     images: Vec<String>,
 }
 
-async fn add_comment(State(home): Shared, Path(id): Path<i64>, Json(c): Json<NewComment>) -> Response {
+async fn add_comment(
+    State(home): Shared,
+    Extension(who): Extension<Who>,
+    Path(id): Path<i64>,
+    Json(c): Json<NewComment>,
+) -> Response {
     with_store(home, move |h, s| {
         for file in &c.images {
             image_saved(h, file)?;
         }
-        s.add_comment(id, "me", &c.body, &c.images)
+        let author = who.user.as_ref().map_or("me", |u| u.name.as_str());
+        s.add_comment_by(id, author, who.user.as_ref().map(|u| u.id), &c.body, &c.images)
     })
     .await
 }
@@ -815,6 +863,400 @@ async fn save_image(State(home): Shared, headers: HeaderMap, body: Bytes) -> Rep
     Ok(Json(json!({ "file": file, "path": path.display().to_string() })).into_response())
 }
 
+/// Asked on every request, so what it learns from the database is kept for a moment. A change
+/// made on this board forgets it at once; one made from the terminal, with `kanzo user`,
+/// takes up to `REMEMBERED` to show.
+struct Auth {
+    home: Home,
+    seen: Mutex<Seen>,
+    failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+#[derive(Default)]
+struct Seen {
+    accounts: Option<(bool, Instant)>,
+    /// By the digest of a session or an access token.
+    users: HashMap<String, (Option<User>, Instant)>,
+}
+
+const REMEMBERED: Duration = Duration::from_secs(10);
+/// Wrong passwords one address can send before it waits.
+const FAILURES: u32 = 10;
+const FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+impl Auth {
+    fn new(home: Home) -> Self {
+        Self { home, seen: Mutex::default(), failures: Mutex::default() }
+    }
+
+    fn forget(&self) {
+        *self.seen.lock().unwrap() = Seen::default();
+    }
+
+    async fn accounts(&self) -> Result<bool, Fail> {
+        if let Some((on, at)) = self.seen.lock().unwrap().accounts
+            && at.elapsed() < REMEMBERED
+        {
+            return Ok(on);
+        }
+        let home = self.home.clone();
+        let on = blocking(move || home.store()?.has_users()).await??;
+        self.seen.lock().unwrap().accounts = Some((on, Instant::now()));
+        Ok(on)
+    }
+
+    async fn user(&self, digest: String, session: bool) -> Result<Option<User>, Fail> {
+        {
+            let mut seen = self.seen.lock().unwrap();
+            seen.users.retain(|_, (_, at)| at.elapsed() < REMEMBERED);
+            if let Some((user, _)) = seen.users.get(&digest) {
+                return Ok(user.clone());
+            }
+        }
+        let (home, key) = (self.home.clone(), digest.clone());
+        let user = blocking(move || {
+            let store = home.store()?;
+            if session { store.session_user(&key) } else { store.token_user(&key) }
+        })
+        .await??;
+        self.seen.lock().unwrap().users.insert(digest, (user.clone(), Instant::now()));
+        Ok(user)
+    }
+
+    fn locked_out(&self, ip: IpAddr) -> bool {
+        let mut failures = self.failures.lock().unwrap();
+        failures.retain(|_, (_, since)| since.elapsed() < FAILURE_WINDOW);
+        failures.get(&ip).is_some_and(|(count, _)| *count >= FAILURES)
+    }
+
+    fn failed(&self, ip: IpAddr) {
+        self.failures.lock().unwrap().entry(ip).or_insert((0, Instant::now())).0 += 1;
+    }
+}
+
+impl Who {
+    fn user(&self) -> Result<&User, Fail> {
+        self.user.as_ref().ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "sign in to do that"))
+    }
+
+    /// On a board without accounts everyone may do what an admin does, as before.
+    fn admin(&self) -> Result<(), Fail> {
+        match &self.user {
+            Some(user) if !user.admin => Err(fail(StatusCode::FORBIDDEN, "only an admin can do that")),
+            None if self.accounts => Err(fail(StatusCode::UNAUTHORIZED, "sign in to do that")),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let all = headers.get_all(header::COOKIE);
+    let mut pairs = all.iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';'));
+    pairs.find_map(|pair| pair.trim().strip_prefix(name)?.strip_prefix('='))
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+}
+
+/// What anyone may load: the page that asks for the login, and what it needs to ask.
+fn open_to_all(req: &Request) -> bool {
+    let path = req.uri().path();
+    // `kanzo share` and `kanzo join` ask the board on this computer, with no login to give. A
+    // proxy on this computer would make every visitor look local, so what it forwards doesn't count.
+    if path == "/api/network" || path == "/api/open" {
+        let forwarded = ["forwarded", "x-forwarded-for", "x-real-ip"].iter().any(|h| req.headers().contains_key(*h));
+        return guest(req).is_none() && !forwarded;
+    }
+    const OPEN: [&str; 8] = [
+        "/",
+        "/app.js",
+        "/logo.png",
+        "/icon.png",
+        "/manifest.webmanifest",
+        "/changelog.md",
+        "/api/ping",
+        "/api/session",
+    ];
+    OPEN.contains(&path) || path.starts_with("/i18n/")
+}
+
+/// Finds who is asking, from a browser's session cookie or an agent's access token, and on
+/// a board with accounts turns away everyone else.
+async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next: Next) -> Response {
+    // Digests, not the headers: a request can't be borrowed across the waits below.
+    let token = bearer(req.headers()).map(auth::digest);
+    let session = cookie(req.headers(), auth::COOKIE).map(auth::digest);
+    let found = async {
+        let accounts = auth.accounts().await?;
+        let mut who = Who { accounts, ..Default::default() };
+        if !accounts {
+            return Ok(who);
+        }
+        if let Some(token) = token {
+            who.user = auth.user(token, false).await?;
+        } else if let Some(session) = session {
+            who.user = auth.user(session.clone(), true).await?;
+            who.session = who.user.is_some().then_some(session);
+        }
+        Ok::<_, Fail>(who)
+    };
+    let who = match found.await {
+        Ok(who) => who,
+        Err(e) => return e.into_response(),
+    };
+    if who.accounts && who.user.is_none() && !open_to_all(&req) {
+        let mut res = (StatusCode::UNAUTHORIZED, Json(json!({ "error": "sign in to use this board", "login": true })))
+            .into_response();
+        res.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        return res;
+    }
+    req.extensions_mut().insert(who);
+    next.run(req).await
+}
+
+fn session_cookie(value: &str, seconds: u32) -> HeaderValue {
+    // No `Secure`: the board is plain HTTP on a home network. `HttpOnly` keeps it from scripts.
+    let cookie = format!("{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={seconds}", auth::COOKIE);
+    HeaderValue::from_str(&cookie).expect("hex and digits only")
+}
+
+const SESSION_SECONDS: u32 = 30 * 24 * 60 * 60;
+
+#[derive(Serialize)]
+struct Session {
+    /// False until the board has its first user: there is then nobody to sign in as.
+    accounts: bool,
+    user: Option<User>,
+}
+
+async fn session(Extension(who): Extension<Who>) -> Response {
+    Json(Session { accounts: who.accounts, user: who.user }).into_response()
+}
+
+/// Signs `user` in from this browser.
+async fn start_session(home: Arc<Home>, auth: &Auth, user: User) -> Reply {
+    let secret = auth::new_session();
+    let (digest, id) = (auth::digest(&secret), user.id);
+    blocking(move || home.store()?.create_session(id, &digest)).await??;
+    auth.forget();
+    let mut res = Json(Session { accounts: true, user: Some(user) }).into_response();
+    res.headers_mut().insert(header::SET_COOKIE, session_cookie(&secret, SESSION_SECONDS));
+    Ok(res)
+}
+
+#[derive(Deserialize)]
+struct Login {
+    name: String,
+    password: String,
+}
+
+async fn sign_in(
+    State(home): Shared,
+    Extension(auth): Extension<Arc<Auth>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Json(login): Json<Login>,
+) -> Reply {
+    let ip = peer.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |c| c.0.0.ip());
+    if auth.locked_out(ip) {
+        return Err(fail(StatusCode::TOO_MANY_REQUESTS, "too many wrong passwords: wait a few minutes"));
+    }
+    let checking = home.clone();
+    let user = blocking(move || -> store::Result<Option<User>> {
+        let found = checking.store()?.login(&login.name)?;
+        // The store is closed before the slow part, so the check holds no lock on the board.
+        Ok(match found {
+            Some((user, hash)) => auth::verify_password(&login.password, &hash).then_some(user),
+            None => {
+                auth::waste_a_check(&login.password);
+                None
+            }
+        })
+    })
+    .await??;
+    match user {
+        Some(user) => start_session(home, &auth, user).await,
+        None => {
+            auth.failed(ip);
+            Err(fail(StatusCode::UNAUTHORIZED, "Wrong name or password."))
+        }
+    }
+}
+
+async fn sign_out(State(home): Shared, Extension(auth): Extension<Arc<Auth>>, Extension(who): Extension<Who>) -> Reply {
+    if let Some(session) = who.session {
+        blocking(move || home.store()?.delete_session(&session)).await??;
+        auth.forget();
+    }
+    let mut res = Json(json!({})).into_response();
+    res.headers_mut().insert(header::SET_COOKIE, session_cookie("", 0));
+    Ok(res)
+}
+
+async fn users(State(home): Shared) -> Response {
+    with_store(home, |_, s| s.list_users()).await
+}
+
+#[derive(Deserialize)]
+struct NewUser {
+    name: String,
+    password: String,
+    #[serde(default)]
+    admin: bool,
+}
+
+/// The first user turns accounts on, runs the board and is signed in. After that only an admin adds users.
+async fn create_user(
+    State(home): Shared,
+    Extension(auth): Extension<Arc<Auth>>,
+    Extension(who): Extension<Who>,
+    Json(new): Json<NewUser>,
+) -> Reply {
+    who.admin()?;
+    auth::check_password(&new.password).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    let first = !who.accounts;
+    let creating = home.clone();
+    let user = blocking(move || {
+        let hash = auth::hash_password(&new.password);
+        let store = creating.store()?;
+        // Asked again in case two browsers set the board up at once: only one is the first.
+        if first && store.has_users()? {
+            return Err(Error::Invalid("this board already has a user: sign in".into()));
+        }
+        store.create_user(&new.name, &hash, new.admin)
+    })
+    .await??;
+    auth.forget();
+    if first { start_session(home, &auth, user).await } else { Ok(Json(user).into_response()) }
+}
+
+/// Tells a field left out from one set to null, which takes the picture away.
+fn nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
+}
+
+#[derive(Deserialize)]
+struct UserChange {
+    name: Option<String>,
+    password: Option<String>,
+    /// Needed to change your own password.
+    current_password: Option<String>,
+    admin: Option<bool>,
+    #[serde(default, deserialize_with = "nullable")]
+    avatar: Option<Option<String>>,
+}
+
+/// Users change their own name, password and picture; an admin changes anyone's, and who is an admin.
+async fn update_user(
+    State(home): Shared,
+    Extension(auth): Extension<Arc<Auth>>,
+    Extension(who): Extension<Who>,
+    Path(id): Path<i64>,
+    Json(change): Json<UserChange>,
+) -> Reply {
+    let me = who.user()?.clone();
+    let own = me.id == id;
+    if !own && !me.admin {
+        return Err(fail(StatusCode::FORBIDDEN, "only an admin can change another user"));
+    }
+    if change.admin.is_some() && !me.admin {
+        return Err(fail(StatusCode::FORBIDDEN, "only an admin can make someone an admin"));
+    }
+    if let Some(password) = &change.password {
+        auth::check_password(password).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    }
+    let session = who.session.clone();
+    let updated = blocking(move || -> store::Result<Result<User, &'static str>> {
+        if let Some(Some(file)) = &change.avatar {
+            image_saved(&home, file)?;
+        }
+        let mut password = None;
+        if let Some(new) = &change.password {
+            if own {
+                let stored = home.store()?.login(&me.name)?.map(|(_, hash)| hash).unwrap_or_default();
+                if !auth::verify_password(change.current_password.as_deref().unwrap_or(""), &stored) {
+                    return Ok(Err("your current password is wrong"));
+                }
+            }
+            password = Some(auth::hash_password(new));
+        }
+        let store = home.store()?;
+        let patch = UserPatch { name: change.name, password, admin: change.admin, avatar: change.avatar };
+        let (user, old_picture) = store.update_user(id, patch, session.as_deref())?;
+        drop_unused(&home, &store, old_picture)?;
+        Ok(Ok(user))
+    })
+    .await??;
+    auth.forget();
+    match updated {
+        Ok(user) => Ok(Json(user).into_response()),
+        Err(wrong) => Err(fail(StatusCode::FORBIDDEN, wrong)),
+    }
+}
+
+/// A picture nothing shows any more leaves the data folder.
+fn drop_unused(home: &Home, store: &Store, file: Option<String>) -> store::Result<()> {
+    for file in store.unused_images(file.into_iter().collect())? {
+        let _ = std::fs::remove_file(home.images().join(file));
+    }
+    Ok(())
+}
+
+async fn delete_user(
+    State(home): Shared,
+    Extension(auth): Extension<Arc<Auth>>,
+    Extension(who): Extension<Who>,
+    Path(id): Path<i64>,
+) -> Reply {
+    who.admin()?;
+    if who.user()?.id == id {
+        return Err(fail(StatusCode::BAD_REQUEST, "you can't remove yourself: another admin can"));
+    }
+    let user = blocking(move || {
+        let store = home.store()?;
+        let user = store.delete_user(id)?;
+        drop_unused(&home, &store, user.avatar.clone())?;
+        Ok::<_, Error>(user)
+    })
+    .await??;
+    auth.forget();
+    Ok(Json(user).into_response())
+}
+
+async fn tokens(State(home): Shared, Extension(who): Extension<Who>) -> Reply {
+    let id = who.user()?.id;
+    Ok(with_store(home, move |_, s| s.list_tokens(id)).await)
+}
+
+#[derive(Deserialize)]
+struct NewToken {
+    name: String,
+}
+
+/// The only time the token itself is shown: the board keeps its digest.
+async fn create_token(State(home): Shared, Extension(who): Extension<Who>, Json(new): Json<NewToken>) -> Reply {
+    let id = who.user()?.id;
+    let secret = auth::new_token();
+    let digest = auth::digest(&secret);
+    let token = blocking(move || home.store()?.create_token(id, &new.name, &digest)).await??;
+    Ok(Json(json!({ "id": token.id, "name": token.name, "created_at": token.created_at, "token": secret }))
+        .into_response())
+}
+
+async fn delete_token(
+    State(home): Shared,
+    Extension(auth): Extension<Arc<Auth>>,
+    Extension(who): Extension<Who>,
+    Path(id): Path<i64>,
+) -> Reply {
+    let user = who.user()?.id;
+    blocking(move || home.store()?.delete_token(user, id)).await??;
+    auth.forget();
+    Ok(Json(json!({})).into_response())
+}
+
 async fn network(Extension(guard): Extension<Arc<Guard>>) -> Response {
     Json(guard.status()).into_response()
 }
@@ -826,6 +1268,7 @@ async fn change_network(
 ) -> Response {
     match share::change(&home, change).await {
         Ok(net) => {
+            *guard.token.lock().unwrap() = share::token(&home);
             guard.set(net);
             Json(guard.status()).into_response()
         }
@@ -895,7 +1338,8 @@ async fn update_status(Query(q): Query<UpdateQuery>) -> Response {
     Json(json!({ "current": update::CURRENT, "latest": latest, "available": available })).into_response()
 }
 
-async fn update_now(State(home): Shared) -> Reply {
+async fn update_now(State(home): Shared, Extension(who): Extension<Who>) -> Reply {
+    who.admin()?;
     // `can_restart` runs schtasks on Windows, so it waits off the async thread too.
     let dir = home.dir.clone();
     let (restart, installed) = blocking(move || (update::can_restart(&dir), update::install())).await?;
@@ -1190,5 +1634,217 @@ mod tests {
         lan.set(Net::Private);
         assert!(!lan.allows("192.168.1.5:4242"));
         assert_eq!(lan.address(), IpAddr::from(Ipv4Addr::LOCALHOST));
+    }
+
+    /// One request, with its headers, as a browser or an agent sends it.
+    async fn call(port: u16, method: &str, path: &str, headers: &[&str], body: &str) -> (u16, String, String) {
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut head = format!(
+            "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for header in headers {
+            head.push_str(&format!("{header}\r\n"));
+        }
+        conn.write_all(format!("{head}\r\n{body}").as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        conn.read_to_end(&mut reply).await.unwrap();
+        let reply = String::from_utf8_lossy(&reply).into_owned();
+        let status = reply.split(' ').nth(1).unwrap().parse().unwrap();
+        let (head, body) = reply.split_once("\r\n\r\n").unwrap_or((&reply, ""));
+        (status, head.to_string(), body.to_string())
+    }
+
+    /// The `Cookie` header a browser sends after a reply that signed it in.
+    fn signed_in(head: &str) -> String {
+        let line = head.lines().find(|l| l.to_ascii_lowercase().starts_with("set-cookie:")).expect("a session cookie");
+        assert!(line.contains("HttpOnly") && line.contains("SameSite=Lax"), "{line}");
+        format!("Cookie: {}", line.split_once(':').unwrap().1.split(';').next().unwrap().trim())
+    }
+
+    fn json_of(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+    }
+
+    #[tokio::test]
+    async fn a_board_with_users_asks_everyone_to_sign_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::open(tmp.path().to_path_buf()).unwrap();
+        let project = home.store().unwrap().create_project("api", "", None).unwrap();
+        let task = home.store().unwrap().create_task(project.id, "Ship it", "").unwrap();
+        let port = serve_board(&home, Net::Private).await;
+
+        // No users yet: open to all, as before accounts.
+        assert_eq!(call(port, "GET", "/api/board", &[], "").await.0, 200);
+        let (_, _, body) = call(port, "GET", "/api/session", &[], "").await;
+        assert_eq!(json_of(&body), json!({ "accounts": false, "user": null }));
+        assert_eq!(call(port, "GET", "/api/tokens", &[], "").await.0, 401, "nobody to make a token for");
+        let short = r#"{"name":"Ana","password":"short"}"#;
+        assert_eq!(call(port, "POST", "/api/users", &[], short).await.0, 400);
+
+        // The first user turns logins on, and is signed in.
+        let ana_login = r#"{"name":"Ana","password":"correct horse"}"#;
+        let (status, head, body) = call(port, "POST", "/api/users", &[], ana_login).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(json_of(&body)["user"]["admin"], true);
+        let ana = signed_in(&head);
+
+        let (status, head, body) = call(port, "GET", "/api/board", &[], "").await;
+        assert_eq!(status, 401, "{body}");
+        assert!(head.to_ascii_lowercase().contains("www-authenticate: bearer"));
+        assert_eq!(json_of(&body)["login"], true);
+        for closed in ["/api/users", "/api/changes", "/images/0000000000000000.png", "/api/update"] {
+            assert_eq!(call(port, "GET", closed, &[], "").await.0, 401, "{closed}");
+        }
+        assert_eq!(call(port, "POST", "/api/users", &[], r#"{"name":"Eve","password":"let me in"}"#).await.0, 401);
+        for open in ["/", "/app.js", "/api/ping", "/api/session", "/logo.png", "/api/network"] {
+            assert_eq!(call(port, "GET", open, &[], "").await.0, 200, "{open}");
+        }
+        let proxied = ["X-Forwarded-For: 203.0.113.9"];
+        assert_eq!(call(port, "GET", "/api/network", &proxied, "").await.0, 401, "local only to the proxy");
+        assert_eq!(call(port, "GET", "/api/board", &["Cookie: kanzo_session=made-up"], "").await.0, 401);
+        let (status, _, body) = call(port, "GET", "/api/board", &[&ana], "").await;
+        assert_eq!(status, 200);
+        assert_eq!(json_of(&body)["users"][0]["name"], "Ana");
+
+        // Signing in again, with the right password only.
+        let wrong = r#"{"name":"Ana","password":"correct horsf"}"#;
+        assert_eq!(call(port, "POST", "/api/session", &[], wrong).await.0, 401);
+        assert_eq!(
+            call(port, "POST", "/api/session", &[], r#"{"name":"Eve","password":"correct horse"}"#).await.0,
+            401
+        );
+        let (status, head, _) = call(port, "POST", "/api/session", &[], ana_login).await;
+        assert_eq!(status, 200);
+        let second = signed_in(&head);
+        assert_eq!(call(port, "DELETE", "/api/session", &[&second], "").await.0, 200);
+        assert_eq!(call(port, "GET", "/api/board", &[&second], "").await.0, 401, "signed out");
+
+        // Only an admin adds users; everyone changes their own password, knowing the old one.
+        let ben_new = r#"{"name":"Ben","password":"battery staple"}"#;
+        let (status, _, body) = call(port, "POST", "/api/users", &[&ana], ben_new).await;
+        assert_eq!(status, 200, "{body}");
+        let ben_id = json_of(&body)["id"].as_i64().unwrap();
+        assert_eq!(json_of(&body)["admin"], false);
+        let (_, head, _) = call(port, "POST", "/api/session", &[], ben_new).await;
+        let ben = signed_in(&head);
+        let ben_path = format!("/api/users/{ben_id}");
+        assert_eq!(call(port, "POST", "/api/users", &[&ben], r#"{"name":"Cy","password":"long enough"}"#).await.0, 403);
+        assert_eq!(call(port, "PATCH", "/api/users/1", &[&ben], r#"{"name":"Mine"}"#).await.0, 403);
+        assert_eq!(call(port, "PATCH", &ben_path, &[&ben], r#"{"admin":true}"#).await.0, 403);
+        assert_eq!(call(port, "DELETE", "/api/users/1", &[&ben], "").await.0, 403);
+        assert_eq!(call(port, "PATCH", &ben_path, &[&ben], r#"{"password":"a new password"}"#).await.0, 403);
+        let change = r#"{"password":"a new password","current_password":"battery staple"}"#;
+        assert_eq!(call(port, "PATCH", &ben_path, &[&ben], change).await.0, 200);
+        assert_eq!(call(port, "GET", "/api/board", &[&ben], "").await.0, 200, "the browser that changed it stays in");
+        assert_eq!(call(port, "POST", "/api/session", &[], ben_new).await.0, 401, "the old password is gone");
+        assert_eq!(call(port, "DELETE", "/api/users/1", &[&ana], "").await.0, 400, "not yourself");
+
+        // A comment is its writer's, and a task takes an assignee.
+        let comments = format!("/api/tasks/{}/comments", task.id);
+        let (status, _, body) = call(port, "POST", &comments, &[&ben], r#"{"body":"On it"}"#).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            (json_of(&body)["author"].as_str(), json_of(&body)["user_id"].as_i64()),
+            (Some("Ben"), Some(ben_id))
+        );
+        let assign = format!(r#"{{"assignee":{ben_id}}}"#);
+        let (_, _, body) = call(port, "PATCH", &format!("/api/tasks/{}", task.id), &[&ana], &assign).await;
+        assert_eq!(json_of(&body)["assignee"], ben_id);
+
+        // An agent signs in with an access token, and its comments count as its user's.
+        let (status, _, body) = call(port, "POST", "/api/tokens", &[&ana], r#"{"name":"Claude Code"}"#).await;
+        assert_eq!(status, 200, "{body}");
+        let token = json_of(&body)["token"].as_str().unwrap().to_string();
+        assert!(auth::is_token(&token));
+        let bearer = format!("Authorization: Bearer {token}");
+        assert_eq!(call(port, "GET", "/api/board", &[&bearer], "").await.0, 200);
+        assert_eq!(call(port, "GET", "/api/board", &["Authorization: Bearer kz_nope"], "").await.0, 401);
+        let (_, _, body) = call(port, "GET", "/api/tokens", &[&ana], "").await;
+        assert_eq!(json_of(&body)[0]["name"], "Claude Code");
+        assert!(json_of(&body)[0].get("token").is_none(), "shown once only");
+
+        let say = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "add_comment", "arguments": { "id": "api#1", "body": "done" },
+            "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                       "io.modelcontextprotocol/clientCapabilities": {},
+                       "io.modelcontextprotocol/clientInfo": { "name": "claude-code", "version": "1" } } } });
+        let mcp = [
+            "Accept: application/json, text/event-stream",
+            "MCP-Protocol-Version: 2026-07-28",
+            "Mcp-Method: tools/call",
+            "Mcp-Name: add_comment",
+        ];
+        assert_eq!(call(port, "POST", "/mcp", &mcp, &say.to_string()).await.0, 401, "no token, no board");
+        let with_token: Vec<&str> = mcp.iter().copied().chain([bearer.as_str()]).collect();
+        let (status, _, body) = call(port, "POST", "/mcp", &with_token, &say.to_string()).await;
+        assert!(status == 200 && body.contains("Comment added"), "{status} {body}");
+        let last = home.store().unwrap().list_comments(task.id).unwrap().pop().unwrap();
+        assert_eq!((last.author.as_str(), last.user_id), ("claude-code", Some(1)));
+
+        // Removing a user ends their sessions with them.
+        assert_eq!(call(port, "DELETE", &ben_path, &[&ana], "").await.0, 200);
+        assert_eq!(call(port, "GET", "/api/board", &[&ben], "").await.0, 401);
+        assert_eq!(home.store().unwrap().get_task(task.id).unwrap().assignee, None);
+    }
+
+    #[tokio::test]
+    async fn a_profile_picture_is_an_image_the_board_saved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::open(tmp.path().to_path_buf()).unwrap();
+        let port = serve_board(&home, Net::Private).await;
+        let (_, head, _) = call(port, "POST", "/api/users", &[], r#"{"name":"Ana","password":"correct horse"}"#).await;
+        let ana = signed_in(&head);
+
+        let missing = r#"{"avatar":"00000000000000aa.png"}"#;
+        assert_eq!(call(port, "PATCH", "/api/users/1", &[&ana], missing).await.0, 400, "never uploaded");
+        for file in ["00000000000000aa.png", "00000000000000bb.png"] {
+            crate::home::write_whole(&home.images().join(file), b"png").unwrap();
+        }
+        let (status, _, body) = call(port, "PATCH", "/api/users/1", &[&ana], missing).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(json_of(&body)["avatar"], "00000000000000aa.png");
+        assert_eq!(call(port, "GET", "/images/00000000000000aa.png", &[&ana], "").await.0, 200);
+
+        // A new picture, or none, takes the old file with it.
+        call(port, "PATCH", "/api/users/1", &[&ana], r#"{"avatar":"00000000000000bb.png"}"#).await;
+        assert!(!home.images().join("00000000000000aa.png").exists());
+        let (_, _, body) = call(port, "PATCH", "/api/users/1", &[&ana], r#"{"name":"Ana Lima"}"#).await;
+        assert_eq!(json_of(&body)["avatar"], "00000000000000bb.png", "left out, so left alone");
+        let (_, _, body) = call(port, "PATCH", "/api/users/1", &[&ana], r#"{"avatar":null}"#).await;
+        assert!(json_of(&body).get("avatar").is_none());
+        assert!(!home.images().join("00000000000000bb.png").exists());
+    }
+
+    #[tokio::test]
+    async fn a_joined_board_signs_in_to_the_shared_one_with_its_token() {
+        let (host_dir, guest_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let host = Home::open(host_dir.path().to_path_buf()).unwrap();
+        let ana = host.store().unwrap().create_user("Ana", "hash", false).unwrap();
+        let token = auth::new_token();
+        host.store().unwrap().create_token(ana.id, "laptop", &auth::digest(&token)).unwrap();
+        let host_port = serve_board(&host, Net::Sharing).await;
+        let address = format!("127.0.0.1:{host_port}");
+
+        let guest = Home::open(guest_dir.path().to_path_buf()).unwrap();
+        std::fs::write(guest.dir.join(share::FILE), format!("join {address}\n")).unwrap();
+        let without = serve_board(&guest, Net::Joined(address.clone())).await;
+        assert_eq!(call(without, "GET", "/remote/api/board", &[], "").await.0, 401, "the shared board has accounts");
+
+        std::fs::write(guest.dir.join(share::FILE), format!("join {address} {token}\n")).unwrap();
+        assert_eq!(Net::load(&guest), Net::Joined(address.clone()));
+        assert_eq!(share::token(&guest).as_deref(), Some(token.as_str()));
+        let guard = Guard::new(0, Ipv4Addr::LOCALHOST.into(), Net::Joined(address)).with_token(share::token(&guest));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let with = listener.local_addr().unwrap().port();
+        let guard = Arc::new(Guard { port: with, ..guard });
+        let app = router(guest.clone(), guard, CancellationToken::new());
+        tokio::spawn(
+            async move { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await },
+        );
+        // Whatever the browser sent to this board stays here: the token is what signs in there.
+        let (status, _, body) = call(with, "GET", "/remote/api/session", &["Cookie: kanzo_session=local"], "").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(json_of(&body)["user"]["name"], "Ana");
     }
 }
